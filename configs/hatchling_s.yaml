@@ -1,0 +1,87 @@
+seed: 23
+threads: 12
+model:
+  name: hatchling_s
+  d_model: 512
+  n_layers: 24
+  n_heads: 8
+  dk: 64
+  dv: 64
+  d_ff: 2048
+  rank_gate: 96
+  group_kv: 1
+  gw_tokens: 2
+  max_seq: 1024
+  episodic_bytes: 33554432
+  use_predictive_head: true
+  use_episodic_memory: true
+  use_curiosity_bonus: true
+train:
+  stage: pretrain
+  seq_len: 256
+  batch_tokens: 8192
+  grad_accum: 8
+  max_steps: 300000
+  warmup_steps: 3000
+  eval_every: 2000
+  save_dir: out/s
+optim:
+  lr: 0.0002
+  betas: [0.9, 0.95]
+  eps: 0.00000001
+  weight_decay: 0.05
+loss:
+  lambda_pc: 0.1
+  lambda_epi: 0.01
+  lambda_rl: 1.0
+  lambda_kl: 0.02
+rlvr:
+  epsilon_clip: 0.2
+  rho_max: 4.0
+  samples_per_prompt: 2
+  temperature: 0.7
+  kl_target: 0.02
+datasets:
+  pretrain:
+    - name: wikitext2
+      hf_id: Salesforce/wikitext
+      config: wikitext-2-v1
+      split: train
+      limit: 512
+  sft:
+    - name: alpaca_clean
+      hf_id: tatsu-lab/alpaca
+      split: train
+      template: |
+        Instruction: {instruction}
+        Input: {input}
+        Response: {output}
+    - name: math_explanations
+      hf_id: gsm8k
+      split: train
+      limit: 8000
+      template: |
+        Problem: {question}
+        Solution: {answer}
+  math:
+    - name: gsm8k_mini
+      hf_id: openai/gsm8k
+      split: train
+      limit: 4000
+  code:
+    - name: humaneval_mini
+      hf_id: openai/openai_humaneval
+      split: test
+      limit: 164
+      evalplus: true
+probes:
+  palindrome:
+    lengths: [64, 128, 256]
+  mqar:
+    lengths: [128, 256, 512]
+gridworld:
+  size: 6
+  max_steps: 32
+  episodes: 8
+  policy: greedy
+  log_path: logs/gridworld_s.csv
