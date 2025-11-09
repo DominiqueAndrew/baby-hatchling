@@ -147,8 +147,22 @@ def train(args: argparse.Namespace) -> None:
         batch_size = initial_batch_size
     
     # Use multiple CPU workers for parallel data loading (CPU-GPU parallelism)
-    num_workers = min(4, os.cpu_count() or 1) if use_gpu else 0
-    print(f"DataLoader using {num_workers} worker(s) for parallel data loading")
+    # Increase workers to better utilize CPU and keep GPU fed
+    if use_gpu:
+        cpu_count = os.cpu_count() or 1
+        # Use more workers to maximize CPU-GPU parallelism
+        # Leave some cores for system, but use most for data loading
+        num_workers = min(8, max(4, cpu_count - 2))
+        prefetch_factor = 4  # Prefetch more batches ahead
+        print(f"DataLoader using {num_workers} worker(s) for parallel data loading (out of {cpu_count} CPU cores)")
+        print(f"Prefetch factor: {prefetch_factor} (keeps GPU fed with pre-loaded batches)")
+        # Reduce workers if we have issues (can cause silent crashes)
+        # Start conservative and can increase if stable
+        if num_workers > 4:
+            print(f"⚠️  Using {num_workers} workers - if you see silent crashes, try reducing to 4")
+    else:
+        num_workers = 0
+        prefetch_factor = None
     
     dataloader = DataLoader(
         dataset, 
@@ -157,8 +171,9 @@ def train(args: argparse.Namespace) -> None:
         collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=use_gpu,
-        prefetch_factor=2 if num_workers > 0 else None,
-        persistent_workers=num_workers > 0
+        prefetch_factor=prefetch_factor,
+        persistent_workers=num_workers > 0,
+        timeout=60  # Timeout for worker processes (prevents hanging)
     )
     model.to(device)
 
@@ -195,68 +210,134 @@ def train(args: argparse.Namespace) -> None:
     if use_amp:
         print("Using mixed precision training (FP16) for faster GPU training")
     
+    # Print parallelism summary
+    if use_gpu:
+        print("\n" + "="*60)
+        print("CPU-GPU Parallelism Configuration:")
+        print(f"  • GPU: {torch.cuda.get_device_name(0)}")
+        print(f"  • CPU Workers: {num_workers} (prefetching {prefetch_factor} batches)")
+        print(f"  • Batch Size: {batch_size} (GPU processes)")
+        print(f"  • Mixed Precision: Enabled (FP16)")
+        print("="*60 + "\n")
+    
     for epoch in range(10):  # small curriculum loop
-        for batch in tqdm(dataloader, desc=f"{args.stage}-epoch{epoch}"):
-            # Non-blocking transfer for better CPU-GPU parallelism
-            tokens = batch.tokens.to(device, non_blocking=use_gpu)
-            targets = batch.targets.to(device, non_blocking=use_gpu)
-            
-            # Mixed precision forward pass
-            with torch.cuda.amp.autocast(enabled=use_amp):
-                pred_out, _ = model(tokens)
-            logits = pred_out.logits[:, :-1, :]
-            lm_loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), targets[:, : logits.size(1)].reshape(-1), ignore_index=0
-            )
-            lambda_pc = loss_cfg["lambda_pc"] if getattr(model.pred_head, "enabled", True) else 0.0
-            total_loss = lm_loss + lambda_pc * pred_out.pc_loss
-            epi_penalty = torch.tensor(model.episodic_gate_penalty(), device=device)
-            total_loss = total_loss + loss_cfg.get("lambda_epi", 0.0) * epi_penalty
-            
-            # Mixed precision backward pass
-            if use_amp:
-                scaler.scale(total_loss / grad_accum).backward()
-            else:
-                (total_loss / grad_accum).backward()
-            micro_step += 1
+        try:
+            for batch in tqdm(dataloader, desc=f"{args.stage}-epoch{epoch}"):
+                try:
+                    # Non-blocking transfer for better CPU-GPU parallelism
+                    tokens = batch.tokens.to(device, non_blocking=use_gpu)
+                    targets = batch.targets.to(device, non_blocking=use_gpu)
+                    
+                    # Mixed precision forward pass
+                    with torch.cuda.amp.autocast(enabled=use_amp):
+                        pred_out, _ = model(tokens)
+                    
+                    logits = pred_out.logits[:, :-1, :]
+                    lm_loss = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)), targets[:, : logits.size(1)].reshape(-1), ignore_index=0
+                    )
+                    lambda_pc = loss_cfg["lambda_pc"] if getattr(model.pred_head, "enabled", True) else 0.0
+                    total_loss = lm_loss + lambda_pc * pred_out.pc_loss
+                    epi_penalty = torch.tensor(model.episodic_gate_penalty(), device=device)
+                    total_loss = total_loss + loss_cfg.get("lambda_epi", 0.0) * epi_penalty
+                    
+                    # Mixed precision backward pass
+                    if use_amp:
+                        scaler.scale(total_loss / grad_accum).backward()
+                    else:
+                        (total_loss / grad_accum).backward()
+                    micro_step += 1
 
-            if micro_step % grad_accum == 0:
-                # Clear cache before optimizer step to free memory
-                if use_gpu:
-                    torch.cuda.empty_cache()
-                if use_amp:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    optimizer.step()
-                optimizer.zero_grad()
-                bonus = model.pred_head.curiosity_bonus(pred_out.error_trace)
-                logger.log(
-                    {
-                        "step": step,
-                        "loss": float(total_loss.item()),
-                        "lm": float(lm_loss.item()),
-                        "pc": float(pred_out.pc_loss.item()),
-                        "epi": float(epi_penalty.item()),
-                        "bonus": bonus,
-                    }
-                )
-                if args.save:
+                    if micro_step % grad_accum == 0:
+                        # Clear cache before optimizer step to free memory
+                        if use_gpu:
+                            torch.cuda.empty_cache()
+                        if use_amp:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                            optimizer.step()
+                        optimizer.zero_grad()
+                        bonus = model.pred_head.curiosity_bonus(pred_out.error_trace)
+                        logger.log(
+                            {
+                                "step": step,
+                                "loss": float(total_loss.item()),
+                                "lm": float(lm_loss.item()),
+                                "pc": float(pred_out.pc_loss.item()),
+                                "epi": float(epi_penalty.item()),
+                                "bonus": bonus,
+                            }
+                        )
+                        if args.save:
+                            save_path = Path(args.save)
+                            save_path.parent.mkdir(parents=True, exist_ok=True)
+                            torch.save(model.state_dict(), save_path)
+                        
+                        # Clear cache after logging to free memory
+                        if use_gpu:
+                            torch.cuda.empty_cache()
+                        
+                        step += 1
+                        if step >= max_steps:
+                            print(f"\n✅ Reached max_steps ({max_steps}). Training complete.")
+                            return
+                except torch.cuda.OutOfMemoryError as e:
+                    if use_gpu:
+                        torch.cuda.empty_cache()
+                        print(f"\n❌ CUDA Out of Memory Error at step {step}, micro_step {micro_step}")
+                        print(f"   Attempting to recover...")
+                        # Try to save current state
+                        if args.save:
+                            try:
+                                save_path = Path(args.save)
+                                save_path.parent.mkdir(parents=True, exist_ok=True)
+                                torch.save(model.state_dict(), save_path)
+                                print(f"   Saved checkpoint to {save_path}")
+                            except Exception as save_err:
+                                print(f"   Failed to save checkpoint: {save_err}")
+                        raise e
+                    else:
+                        raise e
+                except Exception as e:
+                    print(f"\n❌ Error during training at step {step}, micro_step {micro_step}")
+                    print(f"   Error type: {type(e).__name__}")
+                    print(f"   Error message: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    raise e
+        except KeyboardInterrupt:
+            print(f"\n⚠️  Training interrupted by user at step {step}")
+            if args.save:
+                try:
                     save_path = Path(args.save)
                     save_path.parent.mkdir(parents=True, exist_ok=True)
                     torch.save(model.state_dict(), save_path)
-                
-                # Clear cache after logging to free memory
-                if use_gpu:
-                    torch.cuda.empty_cache()
-                
-                step += 1
-                if step >= max_steps:
-                    return
+                    print(f"   Checkpoint saved to {save_path}")
+                except Exception as e:
+                    print(f"   Failed to save checkpoint: {e}")
+            return
+        except Exception as e:
+            print(f"\n❌ Fatal error in training loop at epoch {epoch}, step {step}")
+            print(f"   Error type: {type(e).__name__}")
+            print(f"   Error message: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Try to save checkpoint before exiting
+            if args.save:
+                try:
+                    save_path = Path(args.save)
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save(model.state_dict(), save_path)
+                    print(f"   Emergency checkpoint saved to {save_path}")
+                except Exception as save_err:
+                    print(f"   Failed to save emergency checkpoint: {save_err}")
+            raise e
         if step >= max_steps:
+            print(f"\n✅ Reached max_steps ({max_steps}). Training complete.")
             break
 
 
