@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 CONFIG=${1:-configs/hatchling_xs.yaml}
+export PYTHONPATH=${PYTHONPATH:-$(pwd)}
 python -m src.trainer \
   --config "$CONFIG" \
   --stage pretrain \
