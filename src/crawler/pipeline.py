@@ -152,7 +152,7 @@ class HatchlingCrawler:
         return False
 
     def _is_duplicate(self, text: str) -> bool:
-        signature = Simhash(text)
+        signature = _simhash_signature(text)
         for existing in self.simhashes[-5000:]:
             if existing.distance(signature) <= self.cfg.simhash_threshold:
                 return True
@@ -295,3 +295,12 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
+def _simhash_signature(text: str) -> Simhash:
+    """Generates a bounded-weight Simhash signature to avoid uint8 overflow."""
+
+    tokens = text.lower().split()
+    if not tokens:
+        return Simhash(0)
+    counts = Counter(tokens)
+    features = [(token, min(freq, 255)) for token, freq in counts.items()]
+    return Simhash(features)
