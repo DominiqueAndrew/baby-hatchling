@@ -67,14 +67,17 @@ def generate_completion(
     prompt: str,
     max_new_tokens: int,
     temperature: float,
+    use_amp: bool = False,
 ) -> Tuple[str, List[int], int]:
     tokens = tokenizer.encode(prompt)
     prompt_len = len(tokens)
     was_training = model.training
     model.eval()
+    device = next(model.parameters()).device
     for _ in range(max_new_tokens):
-        input_ids = torch.tensor(tokens[-model.cfg.max_seq :], dtype=torch.long).unsqueeze(0)
-        pred, _ = model(input_ids, use_memory=False)
+        input_ids = torch.tensor(tokens[-model.cfg.max_seq :], dtype=torch.long).unsqueeze(0).to(device)
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            pred, _ = model(input_ids, use_memory=False)
         logits = pred.logits[0, -1]
         probs = torch.softmax(logits / temperature, dim=-1)
         next_id = torch.multinomial(probs, num_samples=1).item()
@@ -87,9 +90,11 @@ def generate_completion(
     return text, tokens, prompt_len
 
 
-def sequence_logprob(model, token_ids: List[int], prompt_len: int) -> torch.Tensor:
-    input_ids = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0)
-    pred, _ = model(input_ids, use_memory=False)
+def sequence_logprob(model, token_ids: List[int], prompt_len: int, use_amp: bool = False) -> torch.Tensor:
+    device = next(model.parameters()).device
+    input_ids = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(device)
+    with torch.cuda.amp.autocast(enabled=use_amp):
+        pred, _ = model(input_ids, use_memory=False)
     logits = pred.logits[:, :-1, :]
     log_probs = F.log_softmax(logits, dim=-1)
     targets = input_ids[:, 1:]
@@ -105,9 +110,28 @@ def rlvr_loop(args: argparse.Namespace) -> None:
     tokenizer = SentencePieceTokenizer()
     model = build_model(cfg["model"])
     ref_model = build_model(cfg["model"])
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Optimize for GPU if available
+    use_gpu = device.type == "cuda"
+    if use_gpu:
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        # Compile models for faster execution
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            ref_model = torch.compile(ref_model, mode="reduce-overhead")
+            print("Models compiled with torch.compile() for optimization")
+        except Exception as e:
+            print(f"torch.compile() not available or failed: {e}")
+    
     model.to(device)
     ref_model.to(device)
+    
+    # Use mixed precision for GPU
+    use_amp = use_gpu
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    if use_amp:
+        print("Using mixed precision training (FP16) for faster GPU training")
 
     state = torch.load(args.load, map_location="cpu")
     model.load_state_dict(state, strict=False)
@@ -142,9 +166,9 @@ def rlvr_loop(args: argparse.Namespace) -> None:
         math_total = 0.0
         code_total = 0.0
         for task in batch:
-            completion, seq, prompt_len = generate_completion(model, tokenizer, task.prompt, 128, temperature)
-            seq_logp = sequence_logprob(model, seq, prompt_len)
-            ref_logp = sequence_logprob(ref_model, seq, prompt_len).detach()
+            completion, seq, prompt_len = generate_completion(model, tokenizer, task.prompt, 128, temperature, use_amp)
+            seq_logp = sequence_logprob(model, seq, prompt_len, use_amp)
+            ref_logp = sequence_logprob(ref_model, seq, prompt_len, use_amp).detach()
             if task.kind == "math" and task.answer:
                 reward = evaluate_math(completion, task.answer)
                 math_hits += reward
@@ -158,15 +182,22 @@ def rlvr_loop(args: argparse.Namespace) -> None:
             ref_logps.append(ref_logp)
         if not rewards:
             continue
-        logp_tensor = torch.stack(logps)
-        ref_tensor = torch.stack(ref_logps)
-        rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+        logp_tensor = torch.stack(logps).to(device)
+        ref_tensor = torch.stack(ref_logps).to(device)
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)
         policy_loss, ratio = ppo_objective(logp_tensor, ref_tensor, rewards_tensor, epsilon, rho_max)
         kl = torch.mean(logp_tensor - ref_tensor)
         loss = policy_loss + loss_cfg.get("lambda_kl", 0.02) * kl
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        
+        # Mixed precision backward pass
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            optimizer.step()
 
         avg_reward = sum(rewards) / len(rewards)
         logger.log(

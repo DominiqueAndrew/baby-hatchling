@@ -101,10 +101,37 @@ def train(args: argparse.Namespace) -> None:
     dataset = ChunkedDataset(texts, tokenizer, train_cfg["seq_len"])
 
     batch_size = max(1, train_cfg["batch_tokens"] // train_cfg["seq_len"])
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-
+    
     model = build_model(cfg["model"])
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Optimize for GPU if available
+    use_gpu = device.type == "cuda"
+    if use_gpu:
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA Version: {torch.version.cuda}")
+        # Compile model for faster execution (PyTorch 2.0+)
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            print("Model compiled with torch.compile() for optimization")
+        except Exception as e:
+            print(f"torch.compile() not available or failed: {e}")
+    
+    # Use multiple CPU workers for parallel data loading (CPU-GPU parallelism)
+    num_workers = min(4, os.cpu_count() or 1) if use_gpu else 0
+    print(f"DataLoader using {num_workers} worker(s) for parallel data loading")
+    
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        collate_fn=collate_fn,
+        num_workers=num_workers,
+        pin_memory=use_gpu,
+        prefetch_factor=2 if num_workers > 0 else None,
+        persistent_workers=num_workers > 0
+    )
     model.to(device)
 
     if args.load and Path(args.load).exists():
@@ -130,11 +157,22 @@ def train(args: argparse.Namespace) -> None:
     step = 0
     loss_meter = []
     micro_step = 0
+    
+    # Use mixed precision training for GPU (faster and uses less memory)
+    use_amp = use_gpu
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    if use_amp:
+        print("Using mixed precision training (FP16) for faster GPU training")
+    
     for epoch in range(10):  # small curriculum loop
         for batch in tqdm(dataloader, desc=f"{args.stage}-epoch{epoch}"):
-            tokens = batch.tokens.to(device)
-            targets = batch.targets.to(device)
-            pred_out, _ = model(tokens)
+            # Non-blocking transfer for better CPU-GPU parallelism
+            tokens = batch.tokens.to(device, non_blocking=use_gpu)
+            targets = batch.targets.to(device, non_blocking=use_gpu)
+            
+            # Mixed precision forward pass
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                pred_out, _ = model(tokens)
             logits = pred_out.logits[:, :-1, :]
             lm_loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)), targets[:, : logits.size(1)].reshape(-1), ignore_index=0
@@ -143,12 +181,23 @@ def train(args: argparse.Namespace) -> None:
             total_loss = lm_loss + lambda_pc * pred_out.pc_loss
             epi_penalty = torch.tensor(model.episodic_gate_penalty(), device=device)
             total_loss = total_loss + loss_cfg.get("lambda_epi", 0.0) * epi_penalty
-            (total_loss / grad_accum).backward()
+            
+            # Mixed precision backward pass
+            if use_amp:
+                scaler.scale(total_loss / grad_accum).backward()
+            else:
+                (total_loss / grad_accum).backward()
             micro_step += 1
 
             if micro_step % grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
+                if use_amp:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    optimizer.step()
                 optimizer.zero_grad()
                 bonus = model.pred_head.curiosity_bonus(pred_out.error_trace)
                 logger.log(
