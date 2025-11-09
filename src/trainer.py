@@ -100,7 +100,8 @@ def train(args: argparse.Namespace) -> None:
     texts = load_texts(cfg.get("datasets", {}).get(args.stage, []))
     dataset = ChunkedDataset(texts, tokenizer, train_cfg["seq_len"])
 
-    batch_size = max(1, train_cfg["batch_tokens"] // train_cfg["seq_len"])
+    # Calculate initial batch size
+    initial_batch_size = max(1, train_cfg["batch_tokens"] // train_cfg["seq_len"])
     
     model = build_model(cfg["model"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -111,12 +112,39 @@ def train(args: argparse.Namespace) -> None:
     if use_gpu:
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"CUDA Version: {torch.version.cuda}")
+        # Get GPU memory info
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"GPU Total Memory: {total_memory:.2f} GB")
+        
         # Compile model for faster execution (PyTorch 2.0+)
+        # Skip compilation on Python 3.12+ as it's not supported
         try:
-            model = torch.compile(model, mode="reduce-overhead")
-            print("Model compiled with torch.compile() for optimization")
+            import sys
+            if sys.version_info < (3, 12):
+                model = torch.compile(model, mode="reduce-overhead")
+                print("Model compiled with torch.compile() for optimization")
+            else:
+                print("Skipping torch.compile() (not supported on Python 3.12+)")
         except Exception as e:
             print(f"torch.compile() not available or failed: {e}")
+        
+        # Adjust batch size based on available GPU memory
+        # RTX 3090 has 24GB, but we'll be conservative to avoid OOM
+        # The KDA attention mechanism can be memory-intensive
+        if total_memory >= 20:
+            # For 24GB GPUs, use 50% of calculated batch size to be safe
+            # This accounts for KDA attention overhead
+            batch_size = max(1, initial_batch_size // 2)
+            if batch_size != initial_batch_size:
+                print(f"⚠️  Reduced batch size from {initial_batch_size} to {batch_size} for memory safety")
+                print(f"   (KDA attention can be memory-intensive)")
+        else:
+            batch_size = max(1, initial_batch_size // 4)
+            print(f"⚠️  Reduced batch size from {initial_batch_size} to {batch_size} due to limited GPU memory")
+        
+        print(f"Effective batch size: {batch_size} (effective tokens: {batch_size * train_cfg['seq_len']})")
+    else:
+        batch_size = initial_batch_size
     
     # Use multiple CPU workers for parallel data loading (CPU-GPU parallelism)
     num_workers = min(4, os.cpu_count() or 1) if use_gpu else 0
@@ -149,6 +177,9 @@ def train(args: argparse.Namespace) -> None:
     grad_clip = train_cfg.get("grad_clip", 1.0)
     grad_accum = train_cfg.get("grad_accum", 1)
     max_steps = train_cfg.get("max_steps", 1000)
+    
+    if use_gpu:
+        print(f"Gradient accumulation: {grad_accum} (effective batch: {batch_size * grad_accum})")
 
     logger = CSVLogger(Path("logs") / f"train_{args.stage}.csv", ["step", "loss", "lm", "pc", "epi", "bonus"])
 
@@ -190,6 +221,9 @@ def train(args: argparse.Namespace) -> None:
             micro_step += 1
 
             if micro_step % grad_accum == 0:
+                # Clear cache before optimizer step to free memory
+                if use_gpu:
+                    torch.cuda.empty_cache()
                 if use_amp:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -214,6 +248,11 @@ def train(args: argparse.Namespace) -> None:
                     save_path = Path(args.save)
                     save_path.parent.mkdir(parents=True, exist_ok=True)
                     torch.save(model.state_dict(), save_path)
+                
+                # Clear cache after logging to free memory
+                if use_gpu:
+                    torch.cuda.empty_cache()
+                
                 step += 1
                 if step >= max_steps:
                     return
