@@ -40,6 +40,16 @@ def _canonical_url(url: str) -> Optional[str]:
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
 
 
+def _simhash_signature(text: str) -> Simhash:
+    """Generates a bounded-weight Simhash signature to avoid uint8 overflow."""
+    tokens = text.lower().split()
+    if not tokens:
+        return Simhash(0)
+    counts = Counter(tokens)
+    features = [(token, min(freq, 255)) for token, freq in counts.items()]
+    return Simhash(features)
+
+
 @dataclass
 class CrawlSettings:
     output_dir: Path
@@ -295,12 +305,3 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
-def _simhash_signature(text: str) -> Simhash:
-    """Generates a bounded-weight Simhash signature to avoid uint8 overflow."""
-
-    tokens = text.lower().split()
-    if not tokens:
-        return Simhash(0)
-    counts = Counter(tokens)
-    features = [(token, min(freq, 255)) for token, freq in counts.items()]
-    return Simhash(features)
