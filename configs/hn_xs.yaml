@@ -21,8 +21,8 @@ model:
   use_curiosity_bonus: true
 train:
   pretrain:
-    seq_len: 1024
-    batch_tokens: 8192
+    seq_len: 896
+    batch_tokens: 4096
     grad_accum: 32
     grad_clip: 1.0
     max_steps: 120000
