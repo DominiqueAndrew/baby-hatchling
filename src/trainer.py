@@ -15,7 +15,6 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from .gridworld import run_gridworld_stage
 from .model import BabyHatchlingModel, build_model
 from .tokenizer import SentencePieceTokenizer
 from .utils.config import load_config
@@ -84,7 +83,14 @@ def train(args: argparse.Namespace) -> None:
     loss_cfg = cfg["loss"]
 
     if args.stage == "gridworld":
-        run_gridworld_stage(cfg, args)
+        try:
+            from .gridworld import run_gridworld_stage
+            run_gridworld_stage(cfg, args)
+        except ImportError:
+            raise ImportError(
+                "gridworld module not found. The gridworld functionality has been removed. "
+                "Please use 'pretrain' or 'sft' stages instead."
+            )
         return
 
     set_seed(cfg.get("seed", 0))
