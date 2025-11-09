@@ -1,214 +1,135 @@
-# Baby-Hatchling
+# Hatchling-NEURO (Baby-Hatchling v2)
 
-Baby-Hatchling is a CPU-friendly research playground that reproduces the core ideas from the "Project Baby-Hatchling" design brief: a hybrid Transformer with Kimi Delta Attention (KDA) linear blocks, periodic NoPE global attention, predictive-coding auxiliaries, a tiny episodic memory, and a micro-RLVR fine-tuning loop with verifiable rewards. The codebase is intentionally compact so it can run end-to-end on a single desktop CPU with 32 GB RAM.
+Hatchling-NEURO keeps the 3:1 Kimi Delta Attention (KDA) : NoPE-global recipe but adds event-driven spiking gates, predictive-coding auxiliaries, episodic memory, and a verifiable-reward RL stage that all run end-to-end on a single RTX 3090 (24 GB) or equivalent cloud GPU. The repo now ships the full “crawler → pretrain → SFT → micro-RLVR → eval” loop plus configs for the XS (~38 M) and S (~100 M) variants that stay within a 24 GB VRAM envelope via linear attention and grouped KV caches.
 
-## Key features
-- **Hybrid attention stack** – three KDA layers followed by one NoPE global layer using multi-query KV. KDA keeps per-head fast state constant while global layers preserve quality every few blocks.
-- **Predictive coding helpers** – next-token LM head (tied embeddings) and a next-state forecasting head with a stop-gradient teacher. Their errors drive a curiosity signal.
-- **Tiny episodic memory** – a SQLite + FAISS store that learns to write surprising states and retrieve useful context when the model is uncertain.
-- **Micro-RLVR** – PPO-lite RL with truncated importance weights, KL penalty, and unit-test / numeric rewards for GSM8K-mini and HumanEval/EvalPlus-mini.
-- **Evaluation harness** – ARC-Easy, WinoGrande, HellaSwag, GSM8K, HumanEval/EvalPlus, and synthetic long-range probes (palindrome, MQAR, stack).
-- **CPU pragmatics** – gradient accumulation, activation checkpoint toggles, INT8 dynamic quantization, deterministic seeds, contamination checks via MinHash.
+## Highlights
+- **Spike-KDA stacks** – every three Spike-modulated KDA blocks are followed by a NoPE global attention block (MQA/GQA friendly). LIF spikes modulate the per-channel decay `α_t` and write step `β_t`, enabling compute skipping when heads are silent.
+- **Predictive coding + curiosity** – tied-embedding LM head plus a stop-grad next-state head. Errors feed a curiosity bonus and optional episodic writes.
+- **Tiny episodic memory** – SQLite + FAISS store with write-on-surprise / read-on-uncertainty gates and a differentiable penalty to keep accesses controlled.
+- **Verifiable micro-RLVR** – PPO-lite with truncated importance weights, dynamic KL penalties, and sandboxed unit tests for GSM8K-mini and HumanEval/EvalPlus-mini.
+- **Crawler-in-the-loop** – polite English-only crawler (robots-aware, license keywords, Simhash dedup, near-dup filters) that emits JSONL shards consumable by the trainer.
+- **Long-context pragmatics** – KDA keeps constant fast weights (`dk × dv` per head) and NoPE global layers use grouped KV, so 4k ctx fits on 24 GB with gradient accumulation.
 
-## Repo layout
+## Repo layout (trimmed)
 ```
 baby-hatchling/
-  README.md
-  requirements.txt
   configs/
-    hatchling_xs.yaml
-    hatchling_s.yaml
+    hn_xs.yaml            # default 38 M config
+    hn_s.yaml             # 100 M config
+    crawler_english.yaml  # polite crawler template
   scripts/
-    run_pretrain.sh
-    run_sft.sh
-    run_rlvr.sh
-    eval_all.sh
+    run_crawler.sh        # ingest new English-only data
+    run_pretrain.sh       # Stage-A
+    run_sft.sh            # Stage-B
+    run_rlvr.sh           # Stage-C verifiable RL
+    eval_all.sh           # ARC-E, Wino, HellaSwag, GSM8K, HumanEval, probes
+    cloud_*.sh            # remote orchestration on RunPod/AWS/etc.
   src/
-    __init__.py
-    model.py
-    trainer.py
-    policy_rlvr.py
-    attn_kda.py
-    global_attn_nope.py
-    predictive_head.py
-    episodic_mem.py
-    eval_harness/
-      arc_easy.py
-      winogrande.py
-      hellaswag.py
-      gsm8k.py
-      humaneval.py
-      probes.py
+    attn_kda.py           # Spike-KDA recurrent/chunkwise kernels
+    global_attn_nope.py   # NoPE global attention (MQA/GQA)
+    crawler/pipeline.py   # respectful crawler emitting shards
+    predictive_head.py    # LM + next-state + curiosity bonus
+    episodic_mem.py       # SQLite/FAISS episodic store
+    policy_rlvr.py        # PPO-lite w/ truncated IS + dynamic KL
+    trainer.py            # unified pretrain/SFT loop with AMP + grad accum
+    eval_harness/         # ARC-E, Wino, HellaSwag, GSM8K, HumanEval, probes
   tests/
-    test_kda.py
-    test_nope.py
-    test_episodic.py
-    test_sandbox.py
-    test_rlvr_math.py
+    test_kda.py           # streaming vs. full pass equivalence
+    test_nope.py, test_episodic.py, test_rlvr_math.py, test_data_loader.py …
 ```
 
-## Quick start
+## Environment
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# Optional: pin PyTorch threads for reproducibility
-export OMP_NUM_THREADS=8
-export MKL_NUM_THREADS=8
-
-# Pretrain Hatchling-XS on WikiText-2 + OpenWebText-10k shards
-bash scripts/run_pretrain.sh
-
-# Supervised fine-tuning (alapca-like + math/code rationales)
-bash scripts/run_sft.sh
-
-# Micro-RLVR on GSM8K-mini + HumanEval/EvalPlus-mini
-bash scripts/run_rlvr.sh
-
-# Evaluation suite
-bash scripts/eval_all.sh
-
-# Optional Stage-D curiosity gridworld
-bash scripts/run_gridworld.sh configs/hatchling_xs.yaml out/xs_sft.pt
-# Script prints automatically a curiosity summary; manual inspection:
-head logs/gridworld_xs.csv
-ls logs/gridworld_transcripts | head
-
-# Ablation sweep example (baseline vs. no memory)
-bash scripts/run_ablation_eval.sh configs/hatchling_xs.yaml out/xs_rlvr.pt baseline
-cp configs/hatchling_xs.yaml /tmp/no_memory.yaml && yq -Y '.model.use_episodic_memory=false' -i /tmp/no_memory.yaml
-bash scripts/run_ablation_eval.sh /tmp/no_memory.yaml out/xs_rlvr.pt no_memory
 ```
 
-## Ablation toggles
-Each config exposes boolean switches under `model` to simplify the ablations described in the design brief:
+## 0. Crawl & prep English-only shards (optional but recommended)
+```bash
+# Respect robots.txt, license keywords, per-domain quotas, Simhash dedup
+bash scripts/run_crawler.sh configs/crawler_english.yaml
+# Output: data/crawler/shards/shard_0000.jsonl, …
+```
+Any JSONL/TXT glob can be referenced from the training configs via `datasets.*.path`, so your crawler shards are picked up automatically.
 
-- `use_predictive_head`: disable the next-state predictor / curiosity teacher while keeping the LM head active.
-- `use_episodic_memory`: remove the SQLite/FAISS store along with its gate penalty.
-- `use_curiosity_bonus`: zeroes out the intrinsic reward tracker (gridworld summaries still run but report 0 bonuses).
+## 1. Pretrain → SFT → RLVR on one GPU (sequential scripts)
+```bash
+# Stage A – Pretrain (LM + predictive coding) on hn_xs config
+bash scripts/run_pretrain.sh configs/hn_xs.yaml        # saves out/hn_xs_pretrain.pt
 
-Flip these flags to `false` (and optionally adjust the corresponding loss weights) before re-running `run_sft.sh`, `run_rlvr.sh`, or `run_gridworld.sh` to collect ablation metrics without editing code.
+# Stage B – SFT on instructions/math/code rationales
+bash scripts/run_sft.sh configs/hn_xs.yaml out/hn_xs_pretrain.pt   # -> out/hn_xs_sft.pt
 
-## Quantization
-After Stage-C RLVR, export an INT8 dynamic quantized checkpoint:
+# Stage C – Micro-RLVR (unit-test math/code rewards, dynamic KL)
+bash scripts/run_rlvr.sh configs/hn_xs.yaml out/hn_xs_sft.pt       # -> out/hn_xs_rlvr.pt
+
+# Unified evaluation suite + long-range probes
+bash scripts/eval_all.sh out/hn_xs_rlvr.pt
+
+# Optional: curiosity gridworld sanity
+bash scripts/run_gridworld.sh configs/hn_xs.yaml out/hn_xs_sft.pt
+```
+
+## 2. Config matrix (fits 24 GB VRAM with grad accumulation)
+| Config | Layers (Spike-KDA / NoPE) | d_model | Heads | d_k=d_v | Seq | Grad accum | Notes |
+| ------ | ------------------------ | ------- | ----- | ------- | --- | ---------- | ----- |
+| `hn_xs` | 24 (18 / 6) | 640 | 8 | 64 | 2k | 16 | ~38 M params, 18–20 GB w/ bf16 & accum=16 |
+| `hn_s`  | 32 (24 / 8) | 768 | 12 | 64 | 4k | 32 | ~100 M params, ~22–24 GB |
+
+Both configs keep 3:1 Spike-KDA:NoPE, grouped KV for globals, and BF16/FP16 mixed precision with gradient accumulation so a single 3090 sustains the curriculum.
+
+## 3. Verifiable RL knobs
+- Truncated importance sampling via `rho_max`
+- PPO clipping (`epsilon_clip`)
+- **Dynamic KL**: `kl_coeff` auto-tunes toward `rlvr.kl_target`, logged in `logs/rlvr.csv`
+- Sandbox tests live in `src/utils/sandbox.py` (resource-capped)
+
+## 4. Quantization / export
 ```bash
 python - <<'PY'
 import torch, torch.nn as nn
 from torch.ao.quantization import quantize_dynamic
 from src.model import build_model
 from src.utils.config import load_config
-cfg = load_config("configs/hatchling_xs.yaml")
+cfg = load_config("configs/hn_xs.yaml")
 model = build_model(cfg["model"])
-model.load_state_dict(torch.load("out/xs_rlvr.pt", map_location="cpu"))
+model.load_state_dict(torch.load("out/hn_xs_rlvr.pt", map_location="cpu"))
 model.eval()
 quantized = quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
-torch.save(quantized.state_dict(), "out/xs_rlvr_int8.pt")
+torch.save(quantized.state_dict(), "out/hn_xs_rlvr_int8.pt")
 PY
 ```
 
-## Tests
-Run the targeted unit tests with:
+## 5. Cloud workflow (RunPod/AWS/GCP/etc.)
+```bash
+# One-time setup
+bash scripts/cloud_setup.sh
+
+# Training on remote box (defaults to configs/hn_xs.yaml)
+bash scripts/cloud_train.sh pretrain configs/hn_xs.yaml out/hn_xs_pretrain.pt
+bash scripts/cloud_train.sh sft      configs/hn_xs.yaml out/hn_xs_sft.pt out/hn_xs_pretrain.pt
+bash scripts/cloud_train.sh rlvr     configs/hn_xs.yaml out/hn_xs_rlvr.pt out/hn_xs_sft.pt
+
+# Monitor / sync
+bash scripts/cloud_monitor.sh watch
+bash scripts/cloud_sync.sh     # or cloud_autosync.sh for continuous rsync
+```
+RunPod helper scripts (`runpod_setup.sh`, `runpod_web_terminal_*`) print the exact commands wired to the new configs/paths.
+
+## 6. Tests
 ```bash
 pytest -q
 ```
+Coverage:
+- Spike-KDA streaming vs. full pass equivalence (`tests/test_kda.py`)
+- NoPE causality, episodic memory read/write gates, sandbox safety
+- PPO objective clipping + truncated IS
+- Local-shard loader (`tests/test_data_loader.py`) to ensure crawler output is ingestible
 
-The tests focus on:
-- Numerical sanity for the KDA recurrence
-- Shape/causality for global NoPE attention
-- Read/write behaviour of the episodic memory store
-- Sandbox safety for verifiable unit tests
-- PPO clipping and truncated importance math
-- Gridworld episode sanity checks (greedy policy reaches the goal)
+## 7. Tips
+- **Configs:** Copy `configs/hn_xs.yaml` or `configs/hn_s.yaml`, tweak batch tokens / grad accum if you switch hardware.
+- **Crawler:** Adjust `configs/crawler_english.yaml` allow/deny lists to stay license-safe. Shards auto-plug into the training mix via the `datasets.pretrain[].path` entry.
+- **Ablations:** Flip `model.use_predictive_head`, `model.use_episodic_memory`, or `model.use_curiosity_bonus` in YAML before re-running scripts. `scripts/run_ablation_eval.sh` logs each sweep.
+- **Long context:** Increase `model.max_seq` and `train.*.seq_len` together; linear-state KDA keeps memory flat, but watch VRAM when raising `batch_tokens`.
 
-## Cloud Computing Setup
-
-While Baby-Hatchling is designed to run on CPU, you can significantly speed up training by using cloud GPUs while still monitoring results locally. The cloud setup scripts support AWS EC2, GCP Compute Engine, RunPod, Lambda Labs, and generic SSH connections.
-
-### Quick Start
-
-**For RunPod (Recommended - Best Value):**
-```bash
-bash scripts/runpod_setup.sh
-```
-See [RUNPOD_QUICKSTART.md](RUNPOD_QUICKSTART.md) for detailed RunPod setup instructions.
-
-**For Other Providers:**
-```bash
-bash scripts/cloud_setup.sh
-```
-Follow the interactive prompts to configure your cloud provider. This will:
-- Create/connect to a cloud instance
-- Install dependencies (Python, CUDA if GPU)
-- Deploy your code
-- Save configuration to `.cloud_env`
-
-2. **Start training on cloud:**
-   ```bash
-   # Pretrain
-   bash scripts/cloud_train.sh pretrain configs/hatchling_xs.yaml out/xs_pretrain.pt
-   
-   # SFT
-   bash scripts/cloud_train.sh sft configs/hatchling_xs.yaml out/xs_sft.pt out/xs_pretrain.pt
-   
-   # RLVR
-   bash scripts/cloud_train.sh rlvr configs/hatchling_xs.yaml out/xs_rlvr.pt out/xs_sft.pt
-   ```
-
-3. **Monitor training (real-time):**
-   ```bash
-   # Stream training logs
-   bash scripts/cloud_monitor.sh watch
-   
-   # Check GPU usage
-   bash scripts/cloud_monitor.sh gpu
-   
-   # View latest metrics
-   bash scripts/cloud_monitor.sh metrics
-   ```
-
-4. **Sync results to local machine:**
-   ```bash
-   # Manual sync
-   bash scripts/cloud_sync.sh
-   
-   # Auto-sync every 30 seconds (runs in background)
-   bash scripts/cloud_autosync.sh
-   ```
-
-### Workflow
-
-The typical workflow is:
-1. Setup cloud instance once (`cloud_setup.sh`)
-2. Start training on cloud (`cloud_train.sh`)
-3. In another terminal, run auto-sync (`cloud_autosync.sh`) to continuously pull logs and checkpoints
-4. Monitor training with `cloud_monitor.sh` or just watch the local `logs/` directory
-
-All logs and checkpoints are automatically synced to your local `logs/` and `out/` directories, so you can analyze results locally even while training runs on the cloud.
-
-### Supported Providers
-
-- **AWS EC2**: Requires AWS CLI configured. Supports GPU instances (g4dn, p3, etc.)
-- **GCP Compute Engine**: Requires `gcloud` CLI. Supports GPU instances with CUDA
-- **RunPod**: Serverless GPU platform. Just provide SSH details
-- **Lambda Labs**: GPU cloud provider. Just provide SSH details
-- **Generic SSH**: Works with any SSH-accessible machine
-
-### Notes
-
-- The `.cloud_env` file contains sensitive information and is automatically ignored by git
-- Training runs in the background on the remote instance (using `nohup`)
-- Checkpoints are synced incrementally (only new/modified files)
-- You can stop training by SSHing into the instance and killing the process: `kill $(cat ~/baby-hatchling/training.pid)`
-
-### Pricing & Performance Comparison
-
-See [CLOUD_COMPARISON.md](CLOUD_COMPARISON.md) for detailed pricing, speed comparisons, and recommendations for each provider. Quick summary:
-
-- **RunPod**: Best value ($0.29-2.39/hour), 20-60x faster than CPU
-- **Lambda Labs**: Best for research ($1.29-2.99/hour), excellent support
-- **AWS EC2**: Enterprise-grade ($0.53-32.77/hour), most expensive
-- **GCP**: Flexible pricing ($0.70-11.06/hour), good for Google AI integration
-- **Vast.ai**: Ultra budget ($0.20-0.60/hour), variable performance
-
-## References
-Key design references are linked inside the README comments and module docstrings. Notably: Kimi Linear (KDA) [arXiv:2510.26692], NoPE attention [arXiv:2404.12224], RLVR (Ring-1T) inspiration, curiosity via predictive coding, and EvalPlus for robust HumanEval tests.
+Everything needed to run the sequential training stages on your cloud GPU (crawler → pretrain → SFT → RLVR → eval) now ships in-tree with spiking gates, dynamic RL controls, and scripts wired to the new Hatchling-NEURO configs.

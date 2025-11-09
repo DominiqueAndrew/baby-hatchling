@@ -1,0 +1,102 @@
+seed: 17
+threads: 16
+model:
+  name: hn_xs
+  d_model: 640
+  n_layers: 24            # 18 Spike-KDA + 6 NoPE global (3:1)
+  n_heads: 8
+  dk: 64
+  dv: 64
+  d_ff: 2560
+  rank_gate: 256
+  group_kv: 1
+  gw_tokens: 0
+  max_seq: 4096
+  spike_decay: 0.92
+  spike_threshold: 0.35
+  spike_surrogate_beta: 9.0
+  episodic_bytes: 33554432
+  use_predictive_head: true
+  use_episodic_memory: true
+  use_curiosity_bonus: true
+train:
+  pretrain:
+    seq_len: 2048
+    batch_tokens: 32768
+    grad_accum: 16
+    grad_clip: 1.0
+    max_steps: 120000
+  sft:
+    seq_len: 2048
+    batch_tokens: 16384
+    grad_accum: 16
+    grad_clip: 1.0
+    max_steps: 8000
+optim:
+  lr: 0.0002
+  betas: [0.9, 0.95]
+  eps: 1.0e-08
+  weight_decay: 0.02
+loss:
+  lambda_pc: 0.2
+  lambda_epi: 0.02
+  lambda_kl: 0.02
+rlvr:
+  steps: 600
+  epsilon_clip: 0.2
+  rho_max: 4.0
+  samples_per_prompt: 2
+  temperature: 0.8
+  kl_target: 0.02
+datasets:
+  pretrain:
+    - name: wikipedia_en
+      hf_id: Salesforce/wikitext
+      config: wikitext-103-v1
+      split: train
+    - name: c4_en_clean
+      hf_id: c4
+      config: en
+      split: train
+      limit: 5000
+    - name: python_docs
+      hf_id: teknium/python-code-instructions-18k
+      split: train
+      limit: 2000
+    - name: crawler_shards
+      path: data/crawler/shards/*.jsonl
+  sft:
+    - name: alpaca_clean
+      hf_id: tatsu-lab/alpaca
+      split: train
+      template: |
+        Instruction: {instruction}
+        Input: {input}
+        Response: {output}
+    - name: openhermes_en
+      hf_id: teknium/OpenHermes-2.5
+      split: train
+      limit: 5000
+  math:
+    - name: gsm8k_mini
+      hf_id: openai/gsm8k
+      split: train
+      limit: 4000
+  code:
+    - name: humaneval_plus
+      hf_id: evalplus/humanevalplus
+      split: test
+      limit: 164
+probes:
+  palindrome:
+    lengths: [64, 256, 512]
+  mqar:
+    lengths: [128, 256, 512]
+  stack:
+    depths: [8, 16, 32]
+gridworld:
+  size: 5
+  max_steps: 24
+  episodes: 8
+  policy: greedy
+  log_path: logs/gridworld_hn_xs.csv

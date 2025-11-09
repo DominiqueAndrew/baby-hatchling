@@ -1,0 +1,30 @@
+output_dir: data/crawler/shards
+shard_size: 200
+max_pages: 1500
+per_domain_quota: 250
+rate_limit_seconds: 0.75
+user_agent: HatchlingCrawler/0.1 (+https://github.com/inclusionai/baby-hatchling)
+english_only: true
+min_tokens: 120
+max_tokens: 4096
+simhash_threshold: 3
+allow_domains:
+  - en.wikipedia.org
+  - docs.python.org
+  - developer.mozilla.org
+  - man7.org
+deny_patterns:
+  - /login
+  - /account
+license_keywords:
+  - creative commons
+  - cc-by
+  - cc0
+  - public domain
+  - mit license
+  - apache license
+seeds:
+  - https://en.wikipedia.org/wiki/Main_Page
+  - https://docs.python.org/3/
+  - https://developer.mozilla.org/en-US/docs/Web
+  - https://man7.org/linux/man-pages/index.html

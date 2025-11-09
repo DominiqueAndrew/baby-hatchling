@@ -9,7 +9,7 @@ from .common import load_model_and_tokenizer, option_score
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="HellaSwag evaluation")
-    parser.add_argument("--config", default="configs/hatchling_xs.yaml")
+    parser.add_argument("--config", default="configs/hn_xs.yaml")
     parser.add_argument("--load", required=True)
     parser.add_argument("--limit", type=int, default=100)
     args = parser.parse_args()

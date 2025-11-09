@@ -21,7 +21,7 @@ train:
   seq_len: 256
   batch_tokens: 8192
   grad_accum: 4
-  max_steps: 10
+  max_steps: 200000  # Full training (was 10 for testing)
   warmup_steps: 2000
   eval_every: 2000
   save_dir: out/xs

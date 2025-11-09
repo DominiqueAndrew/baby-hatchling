@@ -53,7 +53,7 @@ def evaluate(tasks, model, tokenizer, max_tokens=16):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Synthetic probe evaluation")
-    parser.add_argument("--config", default="configs/hatchling_xs.yaml")
+    parser.add_argument("--config", default="configs/hn_xs.yaml")
     parser.add_argument("--load", required=True)
     parser.add_argument("--examples", type=int, default=32)
     args = parser.parse_args()

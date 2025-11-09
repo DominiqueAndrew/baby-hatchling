@@ -1,10 +1,31 @@
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import nn
+
+
+class LIFSpike(nn.Module):
+    """Leaky integrate-and-fire surrogate spike used for event-driven gating."""
+
+    def __init__(self, decay: float = 0.9, threshold: float = 0.5, surrogate_beta: float = 10.0):
+        super().__init__()
+        self.decay = decay
+        self.threshold = threshold
+        self.surrogate_beta = surrogate_beta
+
+    def forward(self, membrane: torch.Tensor, drive: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Updates the membrane and returns binary spikes with a straight-through gradient."""
+
+        membrane = self.decay * membrane + drive
+        delta = membrane - self.threshold
+        hard = (delta > 0).to(drive.dtype)
+        soft = torch.sigmoid(self.surrogate_beta * delta)
+        spike = hard + (soft - soft.detach())
+        membrane = membrane - hard * self.threshold
+        return membrane, spike
 
 
 class RMSNorm(nn.Module):

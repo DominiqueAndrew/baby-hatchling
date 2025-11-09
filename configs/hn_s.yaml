@@ -1,0 +1,110 @@
+seed: 19
+threads: 16
+model:
+  name: hn_s
+  d_model: 768
+  n_layers: 32            # 24 Spike-KDA + 8 NoPE global
+  n_heads: 12
+  dk: 64
+  dv: 64
+  d_ff: 3072
+  rank_gate: 384
+  group_kv: 3
+  gw_tokens: 0
+  max_seq: 4096
+  spike_decay: 0.94
+  spike_threshold: 0.3
+  spike_surrogate_beta: 10.0
+  episodic_bytes: 50331648
+  use_predictive_head: true
+  use_episodic_memory: true
+  use_curiosity_bonus: true
+train:
+  pretrain:
+    seq_len: 4096
+    batch_tokens: 24576
+    grad_accum: 32
+    grad_clip: 1.0
+    max_steps: 160000
+  sft:
+    seq_len: 4096
+    batch_tokens: 12288
+    grad_accum: 32
+    grad_clip: 1.0
+    max_steps: 12000
+optim:
+  lr: 0.00015
+  betas: [0.9, 0.95]
+  eps: 1.0e-08
+  weight_decay: 0.02
+loss:
+  lambda_pc: 0.25
+  lambda_epi: 0.02
+  lambda_kl: 0.02
+rlvr:
+  steps: 900
+  epsilon_clip: 0.2
+  rho_max: 4.0
+  samples_per_prompt: 2
+  temperature: 0.75
+  kl_target: 0.02
+datasets:
+  pretrain:
+    - name: wikipedia_en
+      hf_id: Salesforce/wikitext
+      config: wikitext-103-v1
+      split: train
+    - name: c4_en
+      hf_id: c4
+      config: en
+      split: train
+      limit: 10000
+    - name: stack_exchange_docs
+      hf_id: flax-sentence-embeddings/stackexchange_cpp
+      split: train
+      limit: 4000
+    - name: python_docs
+      hf_id: teknium/python-code-instructions-18k
+      split: train
+      limit: 4000
+    - name: crawler_shards
+      path: data/crawler/shards/*.jsonl
+  sft:
+    - name: alpaca_clean
+      hf_id: tatsu-lab/alpaca
+      split: train
+      template: |
+        Instruction: {instruction}
+        Input: {input}
+        Response: {output}
+    - name: metamathqa
+      hf_id: meta-math/MetaMathQA
+      split: train
+      limit: 5000
+  math:
+    - name: gsm8k_mini
+      hf_id: openai/gsm8k
+      split: train
+      limit: 8000
+    - name: aqua
+      hf_id: aqua_rat
+      split: train
+      limit: 5000
+  code:
+    - name: humaneval_plus
+      hf_id: evalplus/humanevalplus
+      split: test
+      limit: 164
+probes:
+  palindrome:
+    lengths: [128, 512, 1024]
+  mqar:
+    lengths: [256, 512, 1024]
+  stack:
+    depths: [16, 32, 64]
+gridworld:
+  size: 7
+  max_steps: 28
+  episodes: 8
+  policy: greedy
+  log_path: logs/gridworld_hn_s.csv

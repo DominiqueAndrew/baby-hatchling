@@ -52,6 +52,5 @@ echo ""
 echo "2. Start training:"
 echo "   cd ~/baby-hatchling"
 echo "   source .venv/bin/activate"
-echo "   python -m src.trainer --config configs/hatchling_xs.yaml --stage pretrain --save out/xs_pretrain.pt"
+echo "   python -m src.trainer --config configs/hn_xs.yaml --stage pretrain --save out/hn_xs_pretrain.pt"
 echo ""
-

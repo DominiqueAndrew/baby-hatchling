@@ -26,6 +26,9 @@ class ModelConfig:
     group_kv: int
     gw_tokens: int
     max_seq: int
+    spike_decay: float = 0.9
+    spike_threshold: float = 0.5
+    spike_surrogate_beta: float = 10.0
     vocab_size: int = 32000
     episodic_bytes: int = 32 * 1024 * 1024
     use_predictive_head: bool = True
@@ -60,6 +63,9 @@ class BabyHatchlingModel(nn.Module):
                     dv=cfg.dv,
                     d_ff=cfg.d_ff,
                     rank_gate=cfg.rank_gate,
+                    spike_decay=cfg.spike_decay,
+                    spike_threshold=cfg.spike_threshold,
+                    spike_surrogate_beta=cfg.spike_surrogate_beta,
                 )
                 self.kda_positions.append(idx)
             self.layers.append(block)

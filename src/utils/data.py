@@ -1,8 +1,11 @@
 """Dataset helpers including contamination checks."""
 from __future__ import annotations
 
+import glob
 import hashlib
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, List, Mapping, Sequence
 
 from datasketch import MinHash, MinHashLSH
@@ -24,6 +27,28 @@ def _render_template(template: str, example: Mapping[str, object]) -> str:
     return template.format_map(safe_map)
 
 
+def _load_local_samples(path_pattern: str, name: str | None = None) -> List[Sample]:
+    samples: List[Sample] = []
+    for path in sorted(glob.glob(path_pattern)):
+        file_path = Path(path)
+        source = name or file_path.name
+        if file_path.suffix == ".jsonl":
+            with file_path.open("r", encoding="utf8") as handle:
+                for line in handle:
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    text = data.get("text") or data.get("content") or ""
+                    if text:
+                        samples.append(Sample(text=text, source=source))
+        else:
+            text = file_path.read_text(encoding="utf8")
+            if text:
+                samples.append(Sample(text=text, source=source))
+    return samples
+
+
 def load_text_splits(specs: Sequence[dict], text_field: str = "text") -> List[Sample]:
     """Loads a list of text samples from HF datasets.
 
@@ -36,6 +61,10 @@ def load_text_splits(specs: Sequence[dict], text_field: str = "text") -> List[Sa
 
     samples: List[Sample] = []
     for spec in specs:
+        local_path = spec.get("path")
+        if local_path:
+            samples.extend(_load_local_samples(local_path, spec.get("name")))
+            continue
         config_name = spec.get("config")
         trust_remote_code = spec.get("trust_remote_code", False)
         dataset = load_dataset(spec["hf_id"], config_name, split=spec.get("split", "train"), trust_remote_code=trust_remote_code) if config_name else load_dataset(spec["hf_id"], split=spec.get("split", "train"), trust_remote_code=trust_remote_code)

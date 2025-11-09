@@ -16,8 +16,8 @@ source "$PROJECT_ROOT/.cloud_env"
 
 # Parse arguments
 STAGE=${1:-pretrain}
-CONFIG=${2:-configs/hatchling_xs.yaml}
-SAVE_PATH=${3:-out/xs_${STAGE}.pt}
+CONFIG=${2:-configs/hn_xs.yaml}
+SAVE_PATH=${3:-out/hn_xs_${STAGE}.pt}
 LOAD_PATH=${4:-""}
 
 # Build SSH options
@@ -60,4 +60,3 @@ echo "  ssh ${CLOUD_USER}@${CLOUD_HOST} 'tail -f ~/baby-hatchling/training.log'"
 echo ""
 echo "To sync results:"
 echo "  bash scripts/cloud_sync.sh"
-

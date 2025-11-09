@@ -7,14 +7,15 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from .modules import HeadwiseRMSNorm, RMSNorm, SwiGLU, depthwise_short_conv
+from .modules import HeadwiseRMSNorm, LIFSpike, RMSNorm, SwiGLU, depthwise_short_conv
 
 
 @dataclass
 class KDAState:
-    """Container for the per-head fast state S (dk x dv)."""
+    """Container for the fast weight and spiking membrane state."""
 
     tensor: torch.Tensor  # [B,H,dk,dv]
+    spike_mem: torch.Tensor  # [B,H,dk]
 
     @classmethod
     def zeros(
@@ -28,7 +29,8 @@ class KDAState:
         dtype: torch.dtype,
     ) -> "KDAState":
         tensor = torch.zeros(batch, heads, dk, dv, device=device, dtype=dtype)
-        return cls(tensor=tensor)
+        spike_mem = torch.zeros(batch, heads, dk, device=device, dtype=dtype)
+        return cls(tensor=tensor, spike_mem=spike_mem)
 
 
 class KDABlock(nn.Module):
@@ -42,6 +44,9 @@ class KDABlock(nn.Module):
         dv: int,
         d_ff: int,
         rank_gate: int,
+        spike_decay: float = 0.9,
+        spike_threshold: float = 0.5,
+        spike_surrogate_beta: float = 10.0,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -57,8 +62,14 @@ class KDABlock(nn.Module):
         self.v_proj = nn.Linear(d_model, num_heads * dv, bias=False)
         self.out_proj = nn.Linear(num_heads * dv, d_model, bias=False)
 
-        self.alpha_proj = nn.Linear(d_model, num_heads * dk)
+        self.spike_proj = nn.Linear(d_model, num_heads * dk, bias=False)
+        self.lif = LIFSpike(decay=spike_decay, threshold=spike_threshold, surrogate_beta=spike_surrogate_beta)
+
+        self.alpha_up = nn.Linear(d_model, rank_gate)
+        self.alpha_down = nn.Linear(rank_gate, num_heads * dk)
+        self.alpha_spike = nn.Parameter(torch.zeros(1, num_heads, dk))
         self.beta_proj = nn.Linear(d_model, num_heads)
+        self.beta_spike = nn.Parameter(torch.zeros(1, num_heads, dk))
 
         self.head_norm = HeadwiseRMSNorm(num_heads, dv)
         self.low_rank_u1 = nn.Linear(d_model, rank_gate)
@@ -85,6 +96,9 @@ class KDABlock(nn.Module):
         if state is None:
             state = KDAState.zeros(bsz, self.num_heads, self.dk, self.dv, device=device, dtype=dtype)
         s = state.tensor
+        spike_mem = getattr(state, "spike_mem", None)
+        if spike_mem is None:
+            spike_mem = torch.zeros(bsz, self.num_heads, self.dk, device=device, dtype=dtype)
 
         h = self.norm_in(x)
         conv = self.short_conv(h.transpose(1, 2)).transpose(1, 2)
@@ -97,12 +111,18 @@ class KDABlock(nn.Module):
         q = q / (q.norm(dim=-1, keepdim=True) + 1e-6)
         k = k / (k.norm(dim=-1, keepdim=True) + 1e-6)
 
-        alpha = torch.sigmoid(self._reshape_heads(self.alpha_proj(h), self.dk))
-        beta = torch.sigmoid(self.beta_proj(h)).unsqueeze(-1)  # [B,T,H,1]
+        spike_drive = self._reshape_heads(self.spike_proj(h), self.dk)
+        alpha_base = self._reshape_heads(self.alpha_down(torch.nn.functional.silu(self.alpha_up(h))), self.dk)
+        beta_base = self.beta_proj(h)  # [B,T,H]
 
         outputs = []
         for t in range(seq):
-            s, out = self._step(s, q[:, t], k[:, t], v[:, t], alpha[:, t], beta[:, t])
+            spike_mem, spike = self.lif(spike_mem, spike_drive[:, t])
+            alpha = torch.sigmoid(alpha_base[:, t] + self.alpha_spike * spike)
+            beta = beta_base[:, t].unsqueeze(-1)
+            beta = torch.sigmoid(beta + torch.sum(spike * self.beta_spike, dim=-1, keepdim=True))
+            active = (spike.abs().sum(dim=-1, keepdim=True) > 0).to(x.dtype)
+            s, out = self._step(s, q[:, t], k[:, t], v[:, t], alpha, beta, active)
             outputs.append(out)
         y = torch.stack(outputs, dim=1)  # [B,T,H,dv]
         y = self.head_norm(y).reshape(bsz, seq, -1)
@@ -111,7 +131,7 @@ class KDABlock(nn.Module):
         y = x + self.out_proj(y) * gate
         y = y + self.ff(self.ff_norm(y))
 
-        return y, KDAState(tensor=s)
+        return y, KDAState(tensor=s, spike_mem=spike_mem)
 
     def _step(
         self,
@@ -121,9 +141,13 @@ class KDABlock(nn.Module):
         v: torch.Tensor,
         alpha: torch.Tensor,
         beta: torch.Tensor,
+        active: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs a single recurrent step (vectorized over batch+heads)."""
 
+        if active is not None:
+            alpha = torch.where(active.expand_as(alpha) > 0, alpha, torch.ones_like(alpha))
+            beta = beta * active
         # Apply channel-wise decay
         s = s * alpha.unsqueeze(-1)
         # Rank-1 forget via k^T S term
@@ -140,3 +164,11 @@ class KDABlock(nn.Module):
     def _reshape_heads(self, proj: torch.Tensor, width: int) -> torch.Tensor:
         bsz, seq, _ = proj.shape
         return proj.view(bsz, seq, self.num_heads, width)
+
+    def stream(self, x_t: torch.Tensor, state: Optional[KDAState] = None) -> Tuple[torch.Tensor, KDAState]:
+        """Processes a single timestep (useful for autoregressive decoding)."""
+
+        if x_t.dim() == 2:
+            x_t = x_t.unsqueeze(1)
+        y, new_state = self.forward(x_t, state)
+        return y[:, 0], new_state

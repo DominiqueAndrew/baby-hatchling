@@ -10,7 +10,7 @@ from ..utils.sandbox import run_tests
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="HumanEval/EvalPlus mini evaluation")
-    parser.add_argument("--config", default="configs/hatchling_xs.yaml")
+    parser.add_argument("--config", default="configs/hn_xs.yaml")
     parser.add_argument("--load", required=True)
     parser.add_argument("--limit", type=int, default=50)
     args = parser.parse_args()

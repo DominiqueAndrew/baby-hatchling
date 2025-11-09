@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG=${1:-configs/hatchling_xs.yaml}
-CKPT=${2:-out/xs_rlvr.pt}
+CONFIG=${1:-configs/hn_xs.yaml}
+CKPT=${2:-out/hn_xs_rlvr.pt}
 LABEL=${3:-baseline}
 
 python -m src.eval_harness.arc_easy --config "$CONFIG" --load "$CKPT" > logs/ablation_${LABEL}_arc_easy.txt

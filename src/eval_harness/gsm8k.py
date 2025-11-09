@@ -17,7 +17,7 @@ def extract_number(text: str) -> str | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="GSM8K-mini evaluation")
-    parser.add_argument("--config", default="configs/hatchling_xs.yaml")
+    parser.add_argument("--config", default="configs/hn_xs.yaml")
     parser.add_argument("--load", required=True)
     parser.add_argument("--limit", type=int, default=64)
     args = parser.parse_args()

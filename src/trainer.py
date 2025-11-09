@@ -47,13 +47,22 @@ class ChunkedDataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, idx: int) -> Batch:
+        # Do CPU-side tensor operations to utilize CPU workers
         seq = torch.tensor(self.examples[idx], dtype=torch.long)
-        return Batch(tokens=seq[:-1], targets=seq[1:])
+        # Pre-split on CPU (moves work from GPU to CPU)
+        tokens = seq[:-1].clone()  # Clone to ensure memory is allocated on CPU
+        targets = seq[1:].clone()
+        return Batch(tokens=tokens, targets=targets)
 
 
 def collate_fn(batch: Sequence[Batch]) -> Batch:
+    # Do CPU-side batching operations to utilize CPU workers
+    # Stack tensors on CPU before transfer to GPU
     tokens = torch.stack([item.tokens for item in batch], dim=0)
     targets = torch.stack([item.targets for item in batch], dim=0)
+    # Ensure contiguous memory layout for efficient GPU transfer
+    tokens = tokens.contiguous()
+    targets = targets.contiguous()
     return Batch(tokens=tokens, targets=targets)
 
 
@@ -78,7 +87,10 @@ def load_texts(specs: Sequence[dict]) -> List[str]:
 
 def train(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
-    train_cfg = cfg["train"]
+    train_block = cfg.get("train", {})
+    train_cfg = train_block.get(args.stage, train_block)
+    if not train_cfg:
+        raise ValueError(f"No training config found for stage '{args.stage}'.")
     optim_cfg = cfg["optim"]
     loss_cfg = cfg["loss"]
 
@@ -94,7 +106,14 @@ def train(args: argparse.Namespace) -> None:
         return
 
     set_seed(cfg.get("seed", 0))
-    torch.set_num_threads(cfg.get("threads") or os.cpu_count() or 4)
+    use_gpu = torch.cuda.is_available()
+    # Set CPU threads for PyTorch operations (helps with CPU utilization)
+    num_cpu_threads = cfg.get("threads") or max(1, (os.cpu_count() or 4) - 2)
+    torch.set_num_threads(num_cpu_threads)
+    # Enable CPU parallelism for operations
+    torch.set_num_interop_threads(max(1, num_cpu_threads // 2))
+    if use_gpu:
+        print(f"PyTorch CPU threads: {num_cpu_threads} (for CPU-side operations)")
 
     tokenizer = SentencePieceTokenizer()
     texts = load_texts(cfg.get("datasets", {}).get(args.stage, []))
@@ -104,11 +123,10 @@ def train(args: argparse.Namespace) -> None:
     initial_batch_size = max(1, train_cfg["batch_tokens"] // train_cfg["seq_len"])
     
     model = build_model(cfg["model"])
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if use_gpu else "cpu")
     print(f"Using device: {device}")
     
     # Optimize for GPU if available
-    use_gpu = device.type == "cuda"
     if use_gpu:
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"CUDA Version: {torch.version.cuda}")
@@ -151,15 +169,12 @@ def train(args: argparse.Namespace) -> None:
     if use_gpu:
         cpu_count = os.cpu_count() or 1
         # Use more workers to maximize CPU-GPU parallelism
-        # Leave some cores for system, but use most for data loading
-        num_workers = min(8, max(4, cpu_count - 2))
-        prefetch_factor = 4  # Prefetch more batches ahead
+        # Be more aggressive with CPU usage since we're doing CPU-side preprocessing
+        num_workers = min(12, max(6, cpu_count - 1))  # Use more cores for CPU work
+        prefetch_factor = 6  # Prefetch more batches ahead to keep GPU busy
         print(f"DataLoader using {num_workers} worker(s) for parallel data loading (out of {cpu_count} CPU cores)")
         print(f"Prefetch factor: {prefetch_factor} (keeps GPU fed with pre-loaded batches)")
-        # Reduce workers if we have issues (can cause silent crashes)
-        # Start conservative and can increase if stable
-        if num_workers > 4:
-            print(f"⚠️  Using {num_workers} workers - if you see silent crashes, try reducing to 4")
+        print(f"💡 CPU workers will handle tensor operations and batching to maximize CPU-GPU parallelism")
     else:
         num_workers = 0
         prefetch_factor = None

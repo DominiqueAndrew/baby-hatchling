@@ -9,6 +9,11 @@ faiss-cpu
 sqlite-utils
 pyyaml
 datasketch
+requests
+trafilatura
+beautifulsoup4
+simhash
+langdetect
 tiktoken
 tqdm
 pytest

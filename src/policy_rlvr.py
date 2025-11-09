@@ -149,12 +149,14 @@ def rlvr_loop(args: argparse.Namespace) -> None:
         raise ValueError("No RLVR tasks were loaded; please configure datasets.math/code in the YAML file.")
     random.shuffle(tasks)
 
-    logger = CSVLogger(Path("logs") / "rlvr.csv", ["step", "reward", "math", "code", "kl"])
+    logger = CSVLogger(Path("logs") / "rlvr.csv", ["step", "reward", "math", "code", "kl", "kl_coeff"])
     steps = rl_cfg.get("steps", 20)
     epsilon = rl_cfg.get("epsilon_clip", 0.2)
     rho_max = rl_cfg.get("rho_max", 5.0)
     samples_per_prompt = rl_cfg.get("samples_per_prompt", 2)
     temperature = rl_cfg.get("temperature", 0.8)
+    kl_target = rl_cfg.get("kl_target", loss_cfg.get("lambda_kl", 0.02))
+    kl_coeff = loss_cfg.get("lambda_kl", 0.02)
 
     for step in range(steps):
         batch = random.sample(tasks, k=min(samples_per_prompt, len(tasks)))
@@ -187,7 +189,12 @@ def rlvr_loop(args: argparse.Namespace) -> None:
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)
         policy_loss, ratio = ppo_objective(logp_tensor, ref_tensor, rewards_tensor, epsilon, rho_max)
         kl = torch.mean(logp_tensor - ref_tensor)
-        loss = policy_loss + loss_cfg.get("lambda_kl", 0.02) * kl
+        loss = policy_loss + kl_coeff * kl
+        kl_value = float(kl.detach().item())
+        if kl_value > kl_target * 1.5:
+            kl_coeff = min(kl_coeff * 1.5, 1.0)
+        elif kl_value < kl_target / 1.5:
+            kl_coeff = max(kl_coeff / 1.5, 1e-4)
         optimizer.zero_grad()
         
         # Mixed precision backward pass
@@ -206,7 +213,8 @@ def rlvr_loop(args: argparse.Namespace) -> None:
                 "reward": avg_reward,
                 "math": math_hits / max(1.0, math_total),
                 "code": code_hits / max(1.0, code_total),
-                "kl": float(kl.item()),
+                "kl": kl_value,
+                "kl_coeff": kl_coeff,
             }
         )
 

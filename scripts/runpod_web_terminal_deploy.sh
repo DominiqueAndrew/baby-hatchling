@@ -51,10 +51,10 @@ cd ~/baby-hatchling
 source .venv/bin/activate
 
 # Pretrain
-python -m src.trainer --config configs/hatchling_xs.yaml --stage pretrain --save out/xs_pretrain.pt
+python -m src.trainer --config configs/hn_xs.yaml --stage pretrain --save out/hn_xs_pretrain.pt
 
 # Or run in background
-nohup python -m src.trainer --config configs/hatchling_xs.yaml --stage pretrain --save out/xs_pretrain.pt > training.log 2>&1 &
+nohup python -m src.trainer --config configs/hn_xs.yaml --stage pretrain --save out/hn_xs_pretrain.pt > training.log 2>&1 &
 echo $! > training.pid
 
 # Monitor training
@@ -65,4 +65,3 @@ watch -n 1 nvidia-smi
 
 ==========================================
 EOF
-
