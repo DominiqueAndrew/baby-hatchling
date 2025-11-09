@@ -59,6 +59,9 @@ Thumbs.db
 *.log
 *.csv
 
+# Cloud configuration (contains sensitive SSH keys and host info)
+.cloud_env
+
 # Keep structure but ignore content
 !logs/.gitkeep
 !out/.gitkeep

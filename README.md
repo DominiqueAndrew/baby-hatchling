@@ -120,5 +120,95 @@ The tests focus on:
 - PPO clipping and truncated importance math
 - Gridworld episode sanity checks (greedy policy reaches the goal)
 
+## Cloud Computing Setup
+
+While Baby-Hatchling is designed to run on CPU, you can significantly speed up training by using cloud GPUs while still monitoring results locally. The cloud setup scripts support AWS EC2, GCP Compute Engine, RunPod, Lambda Labs, and generic SSH connections.
+
+### Quick Start
+
+**For RunPod (Recommended - Best Value):**
+```bash
+bash scripts/runpod_setup.sh
+```
+See [RUNPOD_QUICKSTART.md](RUNPOD_QUICKSTART.md) for detailed RunPod setup instructions.
+
+**For Other Providers:**
+```bash
+bash scripts/cloud_setup.sh
+```
+Follow the interactive prompts to configure your cloud provider. This will:
+- Create/connect to a cloud instance
+- Install dependencies (Python, CUDA if GPU)
+- Deploy your code
+- Save configuration to `.cloud_env`
+
+2. **Start training on cloud:**
+   ```bash
+   # Pretrain
+   bash scripts/cloud_train.sh pretrain configs/hatchling_xs.yaml out/xs_pretrain.pt
+   
+   # SFT
+   bash scripts/cloud_train.sh sft configs/hatchling_xs.yaml out/xs_sft.pt out/xs_pretrain.pt
+   
+   # RLVR
+   bash scripts/cloud_train.sh rlvr configs/hatchling_xs.yaml out/xs_rlvr.pt out/xs_sft.pt
+   ```
+
+3. **Monitor training (real-time):**
+   ```bash
+   # Stream training logs
+   bash scripts/cloud_monitor.sh watch
+   
+   # Check GPU usage
+   bash scripts/cloud_monitor.sh gpu
+   
+   # View latest metrics
+   bash scripts/cloud_monitor.sh metrics
+   ```
+
+4. **Sync results to local machine:**
+   ```bash
+   # Manual sync
+   bash scripts/cloud_sync.sh
+   
+   # Auto-sync every 30 seconds (runs in background)
+   bash scripts/cloud_autosync.sh
+   ```
+
+### Workflow
+
+The typical workflow is:
+1. Setup cloud instance once (`cloud_setup.sh`)
+2. Start training on cloud (`cloud_train.sh`)
+3. In another terminal, run auto-sync (`cloud_autosync.sh`) to continuously pull logs and checkpoints
+4. Monitor training with `cloud_monitor.sh` or just watch the local `logs/` directory
+
+All logs and checkpoints are automatically synced to your local `logs/` and `out/` directories, so you can analyze results locally even while training runs on the cloud.
+
+### Supported Providers
+
+- **AWS EC2**: Requires AWS CLI configured. Supports GPU instances (g4dn, p3, etc.)
+- **GCP Compute Engine**: Requires `gcloud` CLI. Supports GPU instances with CUDA
+- **RunPod**: Serverless GPU platform. Just provide SSH details
+- **Lambda Labs**: GPU cloud provider. Just provide SSH details
+- **Generic SSH**: Works with any SSH-accessible machine
+
+### Notes
+
+- The `.cloud_env` file contains sensitive information and is automatically ignored by git
+- Training runs in the background on the remote instance (using `nohup`)
+- Checkpoints are synced incrementally (only new/modified files)
+- You can stop training by SSHing into the instance and killing the process: `kill $(cat ~/baby-hatchling/training.pid)`
+
+### Pricing & Performance Comparison
+
+See [CLOUD_COMPARISON.md](CLOUD_COMPARISON.md) for detailed pricing, speed comparisons, and recommendations for each provider. Quick summary:
+
+- **RunPod**: Best value ($0.29-2.39/hour), 20-60x faster than CPU
+- **Lambda Labs**: Best for research ($1.29-2.99/hour), excellent support
+- **AWS EC2**: Enterprise-grade ($0.53-32.77/hour), most expensive
+- **GCP**: Flexible pricing ($0.70-11.06/hour), good for Google AI integration
+- **Vast.ai**: Ultra budget ($0.20-0.60/hour), variable performance
+
 ## References
 Key design references are linked inside the README comments and module docstrings. Notably: Kimi Linear (KDA) [arXiv:2510.26692], NoPE attention [arXiv:2404.12224], RLVR (Ring-1T) inspiration, curiosity via predictive coding, and EvalPlus for robust HumanEval tests.

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,7 +88,7 @@ def train(args: argparse.Namespace) -> None:
         return
 
     set_seed(cfg.get("seed", 0))
-    torch.set_num_threads(cfg.get("threads", 4))
+    torch.set_num_threads(cfg.get("threads") or os.cpu_count() or 4)
 
     tokenizer = SentencePieceTokenizer()
     texts = load_texts(cfg.get("datasets", {}).get(args.stage, []))
