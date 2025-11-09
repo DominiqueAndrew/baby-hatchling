@@ -1,0 +1,25 @@
+# Minimal requirements for training (core only)
+torch==2.3.1
+numpy
+pandas
+datasets
+evaluate
+transformers
+sentencepiece
+faiss-cpu
+sqlite-utils
+pyyaml
+datasketch
+tiktoken
+tqdm
+pytest
+rich
+tabulate
+hf_transfer
+
+# Optional: Remove these if space is tight
+# trafilatura  # Only needed for web scraping
+# beautifulsoup4  # Only needed for HTML parsing
+# simhash  # Only needed for advanced deduplication
+# langdetect  # Only needed for language detection
+
