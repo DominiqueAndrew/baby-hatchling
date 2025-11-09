@@ -146,32 +146,48 @@ def train(args: argparse.Namespace) -> None:
         except Exception as e:
             print(f"torch.compile() not available or failed: {e}")
         
-        # Adjust batch size based on available GPU memory
+        # Adjust batch size based on available GPU memory and sequence length
         # RTX 3090 has 24GB, but we'll be conservative to avoid OOM
-        # The KDA attention mechanism can be memory-intensive
-        if total_memory >= 20:
-            # For 24GB GPUs, use 50% of calculated batch size to be safe
-            # This accounts for KDA attention overhead
-            batch_size = max(1, initial_batch_size // 2)
-            if batch_size != initial_batch_size:
-                print(f"⚠️  Reduced batch size from {initial_batch_size} to {batch_size} for memory safety")
-                print(f"   (KDA attention can be memory-intensive)")
-        else:
+        # The KDA attention mechanism and NoPE global attention can be memory-intensive
+        # Sequence length has quadratic impact on attention memory
+        seq_len = train_cfg["seq_len"]
+        
+        # More aggressive reduction for longer sequences
+        if seq_len >= 2048:
+            # For very long sequences, use 25% of calculated batch size
             batch_size = max(1, initial_batch_size // 4)
-            print(f"⚠️  Reduced batch size from {initial_batch_size} to {batch_size} due to limited GPU memory")
+        elif seq_len >= 1024:
+            # For medium sequences, use 50% of calculated batch size
+            batch_size = max(1, initial_batch_size // 2)
+        else:
+            # For shorter sequences, use 75% of calculated batch size
+            batch_size = max(1, int(initial_batch_size * 0.75))
+        
+        # Additional reduction based on total GPU memory
+        if total_memory < 20:
+            batch_size = max(1, batch_size // 2)
+            print(f"⚠️  Further reduced batch size to {batch_size} due to limited GPU memory ({total_memory:.1f}GB)")
+        
+        if batch_size != initial_batch_size:
+            print(f"⚠️  Reduced batch size from {initial_batch_size} to {batch_size} for memory safety")
+            print(f"   (seq_len={seq_len}, KDA + NoPE attention can be memory-intensive)")
         
         print(f"Effective batch size: {batch_size} (effective tokens: {batch_size * train_cfg['seq_len']})")
     else:
         batch_size = initial_batch_size
     
     # Use multiple CPU workers for parallel data loading (CPU-GPU parallelism)
-    # Increase workers to better utilize CPU and keep GPU fed
+    # Reduce workers if memory is tight to avoid OOM
     if use_gpu:
         cpu_count = os.cpu_count() or 1
-        # Use more workers to maximize CPU-GPU parallelism
-        # Be more aggressive with CPU usage since we're doing CPU-side preprocessing
-        num_workers = min(12, max(6, cpu_count - 1))  # Use more cores for CPU work
-        prefetch_factor = 6  # Prefetch more batches ahead to keep GPU busy
+        # Reduce workers and prefetch for memory-constrained scenarios
+        # With seq_len >= 1024, reduce workers to save GPU memory
+        if train_cfg["seq_len"] >= 1024:
+            num_workers = min(4, max(2, cpu_count // 4))  # Fewer workers for long sequences
+            prefetch_factor = 2  # Less prefetching to save memory
+        else:
+            num_workers = min(8, max(4, cpu_count // 2))
+            prefetch_factor = 4
         print(f"DataLoader using {num_workers} worker(s) for parallel data loading (out of {cpu_count} CPU cores)")
         print(f"Prefetch factor: {prefetch_factor} (keeps GPU fed with pre-loaded batches)")
         print(f"💡 CPU workers will handle tensor operations and batching to maximize CPU-GPU parallelism")
@@ -239,6 +255,10 @@ def train(args: argparse.Namespace) -> None:
         try:
             for batch in tqdm(dataloader, desc=f"{args.stage}-epoch{epoch}"):
                 try:
+                    # Clear cache before each batch to free up memory
+                    if use_gpu:
+                        torch.cuda.empty_cache()
+                    
                     # Non-blocking transfer for better CPU-GPU parallelism
                     tokens = batch.tokens.to(device, non_blocking=use_gpu)
                     targets = batch.targets.to(device, non_blocking=use_gpu)

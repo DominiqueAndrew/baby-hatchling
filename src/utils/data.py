@@ -50,7 +50,7 @@ def _load_local_samples(path_pattern: str, name: str | None = None) -> List[Samp
 
 
 def load_text_splits(specs: Sequence[dict], text_field: str = "text") -> List[Sample]:
-    """Loads a list of text samples from HF datasets.
+    """Loads a list of text samples from HF datasets with parallel processing.
 
     Parameters
     ----------
@@ -58,33 +58,77 @@ def load_text_splits(specs: Sequence[dict], text_field: str = "text") -> List[Sa
         and an optional ``limit`` or ``name``.
     text_field: column to read from, defaults to ``text``.
     """
-
-    samples: List[Sample] = []
-    for spec in specs:
+    import concurrent.futures
+    import os
+    
+    def _load_single_dataset(spec: dict) -> List[Sample]:
+        """Load a single dataset spec."""
         local_path = spec.get("path")
         if local_path:
             try:
-                samples.extend(_load_local_samples(local_path, spec.get("name")))
+                return _load_local_samples(local_path, spec.get("name"))
             except Exception as e:
                 print(f"Warning: Failed to load local dataset '{spec.get('name', local_path)}': {e}")
-            continue
+                return []
+        
         try:
             config_name = spec.get("config")
             trust_remote_code = spec.get("trust_remote_code", False)
-            dataset = load_dataset(spec["hf_id"], config_name, split=spec.get("split", "train"), trust_remote_code=trust_remote_code) if config_name else load_dataset(spec["hf_id"], split=spec.get("split", "train"), trust_remote_code=trust_remote_code)
+            dataset_name = spec.get("name", spec.get("hf_id", "unknown"))
+            print(f"Loading dataset: {dataset_name}...")
+            
+            # Use streaming=False for better caching, but don't use num_proc in threaded context
+            dataset = load_dataset(
+                spec["hf_id"], 
+                config_name, 
+                split=spec.get("split", "train"), 
+                trust_remote_code=trust_remote_code,
+                streaming=False  # Enable caching
+            ) if config_name else load_dataset(
+                spec["hf_id"], 
+                split=spec.get("split", "train"), 
+                trust_remote_code=trust_remote_code,
+                streaming=False  # Enable caching
+            )
+            
             limit = spec.get("limit")
             iterable = dataset if limit is None else dataset.select(range(limit))
+            
+            samples = []
             for example in iterable:
                 template = spec.get("template")
                 if template:
                     text = _render_template(template, example)
                 else:
                     text = example.get(spec.get("field", text_field)) or example.get("content") or ""
-                samples.append(Sample(text=text, source=spec.get("name", spec["hf_id"])) )
+                if text:  # Only add non-empty texts
+                    samples.append(Sample(text=text, source=dataset_name))
+            
+            print(f"Loaded {len(samples)} samples from {dataset_name}")
+            return samples
         except Exception as e:
             print(f"Warning: Failed to load dataset '{spec.get('name', spec.get('hf_id', 'unknown'))}': {e}")
             print(f"  Skipping this dataset and continuing with others...")
-    return samples
+            return []
+
+    # Load datasets in parallel (up to 4 concurrent downloads)
+    all_samples: List[Sample] = []
+    max_workers = min(4, len(specs), os.cpu_count() or 1)
+    
+    print(f"Loading {len(specs)} datasets with up to {max_workers} parallel workers...")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_spec = {executor.submit(_load_single_dataset, spec): spec for spec in specs}
+        for future in concurrent.futures.as_completed(future_to_spec):
+            try:
+                samples = future.result()
+                all_samples.extend(samples)
+            except Exception as e:
+                spec = future_to_spec[future]
+                print(f"Error loading {spec.get('name', spec.get('hf_id', 'unknown'))}: {e}")
+    
+    print(f"Total samples loaded: {len(all_samples)}")
+    return all_samples
 
 
 def minhash_signatures(samples: Iterable[Sample], num_perm: int = 64) -> List[MinHash]:

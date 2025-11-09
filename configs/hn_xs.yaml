@@ -21,9 +21,9 @@ model:
   use_curiosity_bonus: true
 train:
   pretrain:
-    seq_len: 2048
-    batch_tokens: 32768
-    grad_accum: 16
+    seq_len: 1024
+    batch_tokens: 16384
+    grad_accum: 32
     grad_clip: 1.0
     max_steps: 120000
   sft:
@@ -80,59 +80,37 @@ datasets:
       split: train
       limit: 4000
       field: answer
-    - name: alpaca_instructions
+    - name: alpaca_combined
       hf_id: tatsu-lab/alpaca
       split: train
       limit: 5000
-      field: instruction
-    - name: alpaca_inputs
-      hf_id: tatsu-lab/alpaca
-      split: train
-      limit: 5000
-      field: input
-    - name: alpaca_outputs
-      hf_id: tatsu-lab/alpaca
-      split: train
-      limit: 5000
-      field: output
-    - name: meta_math_questions
+      template: |
+        Instruction: {instruction}
+        Input: {input}
+        Response: {output}
+    - name: meta_math_combined
       hf_id: meta-math/MetaMathQA
       split: train
       limit: 5000
-      field: query
-    - name: meta_math_answers
-      hf_id: meta-math/MetaMathQA
-      split: train
-      limit: 5000
-      field: response
-    - name: hellaswag_context
+      template: |
+        Question: {query}
+        Answer: {response}
+    - name: hellaswag_combined
       hf_id: Rowan/hellaswag
       split: train
       limit: 3000
-      field: ctx
-    - name: hellaswag_endings
-      hf_id: Rowan/hellaswag
-      split: train
-      limit: 3000
-      field: endings
-    - name: winogrande_sentence
+      template: |
+        Context: {ctx}
+        Endings: {endings}
+    - name: winogrande_combined
       hf_id: winogrande
       config: winogrande_xl
       split: train
       limit: 2000
-      field: sentence
-    - name: winogrande_options
-      hf_id: winogrande
-      config: winogrande_xl
-      split: train
-      limit: 2000
-      field: option1
-    - name: winogrande_options2
-      hf_id: winogrande
-      config: winogrande_xl
-      split: train
-      limit: 2000
-      field: option2
+      template: |
+        Sentence: {sentence}
+        Option 1: {option1}
+        Option 2: {option2}
     - name: crawler_shards
       path: data/crawler/shards/*.jsonl
   sft:
