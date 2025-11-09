@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 CONFIG=${1:-configs/hatchling_xs.yaml}
-export PYTHONPATH=${PYTHONPATH:-$(pwd)}
+REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+export PYTHONPATH=${PYTHONPATH:-$REPO_ROOT}
 python -m src.trainer \
   --config "$CONFIG" \
   --stage pretrain \
