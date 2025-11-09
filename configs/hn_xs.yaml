@@ -54,15 +54,49 @@ datasets:
       hf_id: Salesforce/wikitext
       config: wikitext-103-v1
       split: train
-    - name: c4_en_clean
-      hf_id: c4
-      config: en
-      split: train
-      limit: 5000
     - name: python_docs
       hf_id: teknium/python-code-instructions-18k
       split: train
+      limit: 5000
+    - name: stackexchange_math
+      hf_id: flax-sentence-embeddings/stackexchange_math
+      split: train
+      limit: 3000
+    - name: stackexchange_cs
+      hf_id: flax-sentence-embeddings/stackexchange_cs
+      split: train
+      limit: 3000
+    - name: stackexchange_programming
+      hf_id: flax-sentence-embeddings/stackexchange_programming
+      split: train
+      limit: 3000
+    - name: stackexchange_cpp
+      hf_id: flax-sentence-embeddings/stackexchange_cpp
+      split: train
       limit: 2000
+    - name: arxiv_papers
+      hf_id: scientific_papers
+      config: arxiv
+      split: train
+      limit: 3000
+      field: article
+    - name: pubmed_abstracts
+      hf_id: scientific_papers
+      config: pubmed
+      split: train
+      limit: 2000
+      field: article
+    - name: code_search_net
+      hf_id: code_search_net
+      config: python
+      split: train
+      limit: 3000
+      field: func_code_string
+    - name: github_code
+      hf_id: bigcode/the-stack
+      split: train
+      limit: 5000
+      field: content
     - name: crawler_shards
       path: data/crawler/shards/*.jsonl
   sft:
