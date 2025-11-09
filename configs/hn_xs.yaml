@@ -59,22 +59,24 @@ datasets:
       config: wikitext-2-v1
       split: train
     - name: python_code_humaneval
-      hf_id: openai/humaneval
+      hf_id: openai/openai_humaneval
       split: test
       limit: 164
       field: prompt
     - name: python_code_solutions
-      hf_id: openai/humaneval
+      hf_id: openai/openai_humaneval
       split: test
       limit: 164
       field: canonical_solution
     - name: gsm8k_questions
       hf_id: openai/gsm8k
+      config: main
       split: train
       limit: 4000
       field: question
     - name: gsm8k_answers
       hf_id: openai/gsm8k
+      config: main
       split: train
       limit: 4000
       field: answer
