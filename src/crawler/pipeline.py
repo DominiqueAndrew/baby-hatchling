@@ -284,4 +284,14 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nCrawler interrupted by user", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
