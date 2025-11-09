@@ -63,20 +63,27 @@ def load_text_splits(specs: Sequence[dict], text_field: str = "text") -> List[Sa
     for spec in specs:
         local_path = spec.get("path")
         if local_path:
-            samples.extend(_load_local_samples(local_path, spec.get("name")))
+            try:
+                samples.extend(_load_local_samples(local_path, spec.get("name")))
+            except Exception as e:
+                print(f"Warning: Failed to load local dataset '{spec.get('name', local_path)}': {e}")
             continue
-        config_name = spec.get("config")
-        trust_remote_code = spec.get("trust_remote_code", False)
-        dataset = load_dataset(spec["hf_id"], config_name, split=spec.get("split", "train"), trust_remote_code=trust_remote_code) if config_name else load_dataset(spec["hf_id"], split=spec.get("split", "train"), trust_remote_code=trust_remote_code)
-        limit = spec.get("limit")
-        iterable = dataset if limit is None else dataset.select(range(limit))
-        for example in iterable:
-            template = spec.get("template")
-            if template:
-                text = _render_template(template, example)
-            else:
-                text = example.get(spec.get("field", text_field)) or example.get("content") or ""
-            samples.append(Sample(text=text, source=spec.get("name", spec["hf_id"])) )
+        try:
+            config_name = spec.get("config")
+            trust_remote_code = spec.get("trust_remote_code", False)
+            dataset = load_dataset(spec["hf_id"], config_name, split=spec.get("split", "train"), trust_remote_code=trust_remote_code) if config_name else load_dataset(spec["hf_id"], split=spec.get("split", "train"), trust_remote_code=trust_remote_code)
+            limit = spec.get("limit")
+            iterable = dataset if limit is None else dataset.select(range(limit))
+            for example in iterable:
+                template = spec.get("template")
+                if template:
+                    text = _render_template(template, example)
+                else:
+                    text = example.get(spec.get("field", text_field)) or example.get("content") or ""
+                samples.append(Sample(text=text, source=spec.get("name", spec["hf_id"])) )
+        except Exception as e:
+            print(f"Warning: Failed to load dataset '{spec.get('name', spec.get('hf_id', 'unknown'))}': {e}")
+            print(f"  Skipping this dataset and continuing with others...")
     return samples
 
 

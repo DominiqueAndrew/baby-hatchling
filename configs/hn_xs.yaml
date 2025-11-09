@@ -54,10 +54,11 @@ datasets:
       hf_id: Salesforce/wikitext
       config: wikitext-103-v1
       split: train
-    - name: python_docs
-      hf_id: teknium/python-code-instructions-18k
+    - name: python_code
+      hf_id: bigcode/python
       split: train
       limit: 5000
+      field: content
     - name: stackexchange_math
       hf_id: flax-sentence-embeddings/stackexchange_math
       split: train
