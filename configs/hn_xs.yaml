@@ -54,50 +54,83 @@ datasets:
       hf_id: Salesforce/wikitext
       config: wikitext-103-v1
       split: train
-    - name: python_code
-      hf_id: bigcode/python
+    - name: wikitext2
+      hf_id: Salesforce/wikitext
+      config: wikitext-2-v1
+      split: train
+    - name: python_code_humaneval
+      hf_id: openai/humaneval
+      split: test
+      limit: 164
+      field: prompt
+    - name: python_code_solutions
+      hf_id: openai/humaneval
+      split: test
+      limit: 164
+      field: canonical_solution
+    - name: gsm8k_questions
+      hf_id: openai/gsm8k
+      split: train
+      limit: 4000
+      field: question
+    - name: gsm8k_answers
+      hf_id: openai/gsm8k
+      split: train
+      limit: 4000
+      field: answer
+    - name: alpaca_instructions
+      hf_id: tatsu-lab/alpaca
       split: train
       limit: 5000
-      field: content
-    - name: stackexchange_math
-      hf_id: flax-sentence-embeddings/stackexchange_math
-      split: train
-      limit: 3000
-    - name: stackexchange_cs
-      hf_id: flax-sentence-embeddings/stackexchange_cs
-      split: train
-      limit: 3000
-    - name: stackexchange_programming
-      hf_id: flax-sentence-embeddings/stackexchange_programming
-      split: train
-      limit: 3000
-    - name: stackexchange_cpp
-      hf_id: flax-sentence-embeddings/stackexchange_cpp
-      split: train
-      limit: 2000
-    - name: arxiv_papers
-      hf_id: scientific_papers
-      config: arxiv
-      split: train
-      limit: 3000
-      field: article
-    - name: pubmed_abstracts
-      hf_id: scientific_papers
-      config: pubmed
-      split: train
-      limit: 2000
-      field: article
-    - name: code_search_net
-      hf_id: code_search_net
-      config: python
-      split: train
-      limit: 3000
-      field: func_code_string
-    - name: github_code
-      hf_id: bigcode/the-stack
+      field: instruction
+    - name: alpaca_inputs
+      hf_id: tatsu-lab/alpaca
       split: train
       limit: 5000
-      field: content
+      field: input
+    - name: alpaca_outputs
+      hf_id: tatsu-lab/alpaca
+      split: train
+      limit: 5000
+      field: output
+    - name: meta_math_questions
+      hf_id: meta-math/MetaMathQA
+      split: train
+      limit: 5000
+      field: query
+    - name: meta_math_answers
+      hf_id: meta-math/MetaMathQA
+      split: train
+      limit: 5000
+      field: response
+    - name: hellaswag_context
+      hf_id: Rowan/hellaswag
+      split: train
+      limit: 3000
+      field: ctx
+    - name: hellaswag_endings
+      hf_id: Rowan/hellaswag
+      split: train
+      limit: 3000
+      field: endings
+    - name: winogrande_sentence
+      hf_id: winogrande
+      config: winogrande_xl
+      split: train
+      limit: 2000
+      field: sentence
+    - name: winogrande_options
+      hf_id: winogrande
+      config: winogrande_xl
+      split: train
+      limit: 2000
+      field: option1
+    - name: winogrande_options2
+      hf_id: winogrande
+      config: winogrande_xl
+      split: train
+      limit: 2000
+      field: option2
     - name: crawler_shards
       path: data/crawler/shards/*.jsonl
   sft:
