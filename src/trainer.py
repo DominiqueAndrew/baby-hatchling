@@ -311,7 +311,10 @@ def train(args: argparse.Namespace) -> None:
 
     step = 0
     micro_step = 0
-    progress = tqdm(total=max_steps, desc=args.stage)
+    # Initialize progress bar with smoothing and mininterval to avoid inflated ETA from slow first step
+    # smoothing=0.1 helps average out the first few slow steps
+    # mininterval=10 means update at most every 10 seconds to avoid flickering
+    progress = tqdm(total=max_steps, desc=args.stage, smoothing=0.1, miniters=1, mininterval=10)
 
     model.train()
     optimizer.zero_grad()
@@ -365,6 +368,8 @@ def train(args: argparse.Namespace) -> None:
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     optimizer.step()
+                # Scheduler should be called after optimizer.step() per PyTorch best practices
+                # Only call after we've actually done an optimizer step (not on step 0 before first update)
                 if scheduler is not None:
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)  # More memory efficient

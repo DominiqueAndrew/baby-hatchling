@@ -108,7 +108,7 @@ class BabyHatchlingModel(nn.Module):
                 new_states.append(updated_state)
             else:
                 if self.use_checkpoint and self.training:
-                    hidden = checkpoint(layer, hidden)
+                    hidden = checkpoint(layer, hidden, use_reentrant=False)
                 else:
                     hidden = layer(hidden)
 
