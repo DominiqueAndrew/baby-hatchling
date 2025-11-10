@@ -17,7 +17,7 @@ model:
   spike_surrogate_beta: 9.0
   episodic_bytes: 16777216
   use_predictive_head: true
-  use_episodic_memory: true
+  use_episodic_memory: false        # Disabled - causes 10-20x slowdown due to GPU→CPU transfers
   use_curiosity_bonus: true
   use_gradient_checkpointing: true
   token_drop:

@@ -388,10 +388,13 @@ def train(args: argparse.Namespace) -> None:
                         "bonus": bonus,
                     }
                 )
-                if args.save:
+                # Save checkpoint every 1000 steps instead of every step to avoid massive slowdown
+                if args.save and (step % 1000 == 0 or step == max_steps - 1):
                     save_path = Path(args.save)
                     save_path.parent.mkdir(parents=True, exist_ok=True)
                     torch.save(model.state_dict(), save_path)
+                    if step % 5000 == 0:  # Print confirmation every 5000 steps
+                        print(f"\n💾 Checkpoint saved to {save_path}")
 
                 step += 1
                 if sparsifier is not None:
@@ -411,6 +414,13 @@ def train(args: argparse.Namespace) -> None:
                             break
 
                 if stage_step >= curriculum[stage_index]["steps"]:
+                    # Save checkpoint at stage transition
+                    if args.save:
+                        save_path = Path(args.save)
+                        save_path.parent.mkdir(parents=True, exist_ok=True)
+                        torch.save(model.state_dict(), save_path)
+                        print(f"\n💾 Stage {stage_index} complete - checkpoint saved to {save_path}")
+                    
                     stage_index += 1
                     if stage_index >= len(curriculum):
                         break
