@@ -63,6 +63,7 @@ class KDABlock(nn.Module):
         self.chunk_size = chunk_size
         self.kda_mode = kda_mode.lower()
         self.scan_min_len = max(1, scan_min_len)
+        self._force_sequential_after_oom = False
         if self.kda_mode not in {"sequential", "chunked", "scan", "auto"}:
             raise ValueError(f"Unsupported kda_mode '{kda_mode}'.")
         threshold_gb = os.environ.get("KDA_SCAN_GPU_THRESHOLD_GB")
@@ -191,15 +192,19 @@ class KDABlock(nn.Module):
         s: torch.Tensor,
         spike_mem: torch.Tensor,
         drop_prob: float,
+        drop_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Sequential token-by-token processing (original implementation)."""
         bsz, seq, heads, _ = q.shape
         device = q.device
         
         outputs = []
-        drop_mask = self._sample_drop_mask(bsz, seq, drop_prob, device)
+        if drop_mask is None:
+            drop_mask = self._sample_drop_mask(bsz, seq, drop_prob, device)
         if drop_mask is None:
             self.last_drop_fraction = 0.0
+        else:
+            self.last_drop_fraction = float(drop_mask.float().mean()) if drop_mask.numel() > 0 else 0.0
         
         prev_out = None
         # Optimize sequential loop with fused operations
@@ -312,106 +317,141 @@ class KDABlock(nn.Module):
         device = q.device
 
         drop_mask = self._sample_drop_mask(bsz, seq, drop_prob, device)
+        if self._force_sequential_after_oom:
+            return self._forward_sequential(
+                q,
+                k,
+                v,
+                spike_drive,
+                alpha_base,
+                beta_base,
+                s,
+                spike_mem,
+                drop_prob,
+                drop_mask=drop_mask,
+            )
 
-        spikes = []
-        current_spike_mem = spike_mem
-        for t in range(seq):
-            current_spike_mem, spike = self.lif(current_spike_mem, spike_drive[:, t])
-            spikes.append(spike)
-        spike_mem = current_spike_mem
-        spike_tensor = torch.stack(spikes, dim=1)
+        state_backup = s.clone()
+        spike_backup = spike_mem.clone()
 
-        alpha = torch.sigmoid(alpha_base + self.alpha_spike.unsqueeze(1) * spike_tensor)
-        beta = torch.sigmoid(
-            beta_base.unsqueeze(-1)
-            + torch.sum(spike_tensor * self.beta_spike.unsqueeze(1), dim=-1, keepdim=True)
-        )
-        active = (spike_tensor.abs().sum(dim=-1, keepdim=True) > 0).to(q.dtype)
+        try:
+            spikes = []
+            current_spike_mem = spike_mem
+            for t in range(seq):
+                current_spike_mem, spike = self.lif(current_spike_mem, spike_drive[:, t])
+                spikes.append(spike)
+            spike_mem = current_spike_mem
+            spike_tensor = torch.stack(spikes, dim=1)
 
-        planned_block = self._select_scan_block_tokens(seq, bsz, device, q.element_size())
-        batch_block = self._select_scan_batch_block(bsz, device)
-        outputs_chunks = []
-        state = s
-        emit_chunk_size = max(1, self.chunk_size)
-        adaptive_block = max(1, planned_block)
-        start = 0
+            alpha = torch.sigmoid(alpha_base + self.alpha_spike.unsqueeze(1) * spike_tensor)
+            beta = torch.sigmoid(
+                beta_base.unsqueeze(-1)
+                + torch.sum(spike_tensor * self.beta_spike.unsqueeze(1), dim=-1, keepdim=True)
+            )
+            active = (spike_tensor.abs().sum(dim=-1, keepdim=True) > 0).to(q.dtype)
 
-        while start < seq:
-            current_block = min(adaptive_block, seq - start)
-            end = start + current_block
-            block_outputs = None
-            pending_states = None
-            block_completed = False
-            while not block_completed:
-                block_outputs = torch.empty(
-                    bsz,
-                    current_block,
-                    self.num_heads,
-                    self.dv,
-                    device=q.device,
-                    dtype=q.dtype,
-                )
-                pending_states = []
-                block_failed = False
-                restart_with_smaller_tokens = False
-                b_start = 0
-                while b_start < bsz:
-                    b_end = min(b_start + batch_block, bsz)
-                    try:
-                        updates: KDAParallelUpdates = precompute_updates(
-                            k[b_start:b_end, start:end],
-                            v[b_start:b_end, start:end],
-                            alpha[b_start:b_end, start:end],
-                            beta[b_start:b_end, start:end],
-                            active[b_start:b_end, start:end],
-                            drop_mask[b_start:b_end, start:end] if drop_mask is not None else None,
-                        )
-                        chunk_outputs, new_state = scan_emit_outputs(
-                            updates,
-                            state[b_start:b_end],
-                            q[b_start:b_end, start:end],
-                            chunk_size=min(emit_chunk_size, end - start),
-                        )
-                    except RuntimeError as exc:
-                        if not self._is_cuda_oom(exc):
+            planned_block = self._select_scan_block_tokens(seq, bsz, device, q.element_size())
+            batch_block = self._select_scan_batch_block(bsz, device)
+            outputs_chunks = []
+            state = s
+            emit_chunk_size = max(1, self.chunk_size)
+            adaptive_block = max(1, planned_block)
+            start = 0
+
+            while start < seq:
+                current_block = min(adaptive_block, seq - start)
+                end = start + current_block
+                block_outputs = None
+                pending_states = None
+                block_completed = False
+                while not block_completed:
+                    block_outputs = torch.empty(
+                        bsz,
+                        current_block,
+                        self.num_heads,
+                        self.dv,
+                        device=q.device,
+                        dtype=q.dtype,
+                    )
+                    pending_states = []
+                    block_failed = False
+                    restart_with_smaller_tokens = False
+                    b_start = 0
+                    while b_start < bsz:
+                        b_end = min(b_start + batch_block, bsz)
+                        try:
+                            updates: KDAParallelUpdates = precompute_updates(
+                                k[b_start:b_end, start:end],
+                                v[b_start:b_end, start:end],
+                                alpha[b_start:b_end, start:end],
+                                beta[b_start:b_end, start:end],
+                                active[b_start:b_end, start:end],
+                                drop_mask[b_start:b_end, start:end] if drop_mask is not None else None,
+                            )
+                            chunk_outputs, new_state = scan_emit_outputs(
+                                updates,
+                                state[b_start:b_end],
+                                q[b_start:b_end, start:end],
+                                chunk_size=min(emit_chunk_size, end - start),
+                            )
+                        except RuntimeError as exc:
+                            if not self._is_cuda_oom(exc):
+                                raise
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            if batch_block > 1:
+                                batch_block = max(1, batch_block // 2)
+                                block_failed = True
+                                break
+                            if current_block > 1:
+                                adaptive_block = max(1, current_block // 2)
+                                restart_with_smaller_tokens = True
+                                block_failed = True
+                                break
                             raise
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        if batch_block > 1:
-                            batch_block = max(1, batch_block // 2)
-                            block_failed = True
-                            break
-                        if current_block > 1:
-                            adaptive_block = max(1, current_block // 2)
-                            restart_with_smaller_tokens = True
-                            block_failed = True
-                            break
-                        raise
-                    block_outputs[b_start:b_end] = chunk_outputs
-                    pending_states.append((b_start, b_end, new_state))
-                    b_start = b_end
+                        block_outputs[b_start:b_end] = chunk_outputs
+                        pending_states.append((b_start, b_end, new_state))
+                        b_start = b_end
 
-                if block_failed:
-                    block_outputs = None
-                    pending_states = None
-                    if restart_with_smaller_tokens:
-                        break
+                    if block_failed:
+                        block_outputs = None
+                        pending_states = None
+                        if restart_with_smaller_tokens:
+                            break
+                        continue
+
+                    block_completed = True
+
+                if not block_completed:
+                    # We reduced token block size; retry with new adaptive_block.
                     continue
 
-                block_completed = True
+                for b_start, b_end, new_state in pending_states:
+                    state[b_start:b_end] = new_state
+                outputs_chunks.append(block_outputs)
+                start = end
 
-            if not block_completed:
-                # We reduced token block size; retry with new adaptive_block.
-                continue
-
-            for b_start, b_end, new_state in pending_states:
-                state[b_start:b_end] = new_state
-            outputs_chunks.append(block_outputs)
-            start = end
-
-        outputs = torch.cat(outputs_chunks, dim=1) if len(outputs_chunks) > 1 else outputs_chunks[0]
-        outputs = self._apply_drop_outputs(outputs, drop_mask)
-        return outputs, state, spike_mem
+            outputs = torch.cat(outputs_chunks, dim=1) if len(outputs_chunks) > 1 else outputs_chunks[0]
+            outputs = self._apply_drop_outputs(outputs, drop_mask)
+            return outputs, state, spike_mem
+        except RuntimeError as exc:
+            if not self._is_cuda_oom(exc):
+                raise
+            self._force_sequential_after_oom = True
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return self._forward_sequential(
+                q,
+                k,
+                v,
+                spike_drive,
+                alpha_base,
+                beta_base,
+                state_backup,
+                spike_backup,
+                drop_prob,
+                drop_mask=drop_mask,
+            )
 
     def _parallel_scan_chunk(
         self,
