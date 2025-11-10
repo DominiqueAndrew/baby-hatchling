@@ -1,6 +1,7 @@
 """Kimi Delta Attention block (linear attention with constant state)."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -64,6 +65,20 @@ class KDABlock(nn.Module):
         self.scan_min_len = max(1, scan_min_len)
         if self.kda_mode not in {"sequential", "chunked", "scan", "auto"}:
             raise ValueError(f"Unsupported kda_mode '{kda_mode}'.")
+        threshold_gb = os.environ.get("KDA_SCAN_GPU_THRESHOLD_GB")
+        try:
+            threshold_gb = int(threshold_gb) if threshold_gb is not None else 30
+        except ValueError:
+            threshold_gb = 30
+        self.scan_memory_threshold_bytes = max(1, threshold_gb) * 1024**3
+        block_override = os.environ.get("KDA_SCAN_BLOCK_TOKENS")
+        if block_override is not None:
+            try:
+                self.scan_block_override = max(1, int(block_override))
+            except ValueError:
+                self.scan_block_override = None
+        else:
+            self.scan_block_override = None
 
         self.norm_in = RMSNorm(d_model)
         self.short_conv = depthwise_short_conv(d_model)
@@ -305,7 +320,7 @@ class KDABlock(nn.Module):
         )
         active = (spike_tensor.abs().sum(dim=-1, keepdim=True) > 0).to(q.dtype)
 
-        block_tokens = max(1, min(seq, max(self.scan_min_len, self.chunk_size)))
+        block_tokens = self._select_scan_block_tokens(seq, bsz, device, q.element_size())
         outputs_chunks = []
         state = s
         emit_chunk_size = max(1, self.chunk_size)
@@ -526,6 +541,49 @@ class KDABlock(nn.Module):
         )
         keep_mask = keep.view(bsz, seq, 1, 1).to(outputs.dtype)
         return outputs * keep_mask + gathered * (1 - keep_mask)
+
+    def _select_scan_block_tokens(
+        self,
+        seq: int,
+        batch: int,
+        device: torch.device,
+        element_size: int,
+    ) -> int:
+        min_block = max(1, self.chunk_size)
+        preferred = max(min_block, self.scan_min_len)
+        if self.scan_block_override is not None:
+            return min(seq, max(min_block, self.scan_block_override))
+
+        block = preferred
+        if device.type == "cuda" and torch.cuda.is_available():
+            try:
+                idx = device.index if device.index is not None else torch.cuda.current_device()
+            except RuntimeError:
+                idx = None
+            if idx is not None:
+                total_mem = None
+                try:
+                    total_mem = torch.cuda.get_device_properties(idx).total_memory
+                except (AssertionError, RuntimeError):
+                    total_mem = None
+                if total_mem is not None and total_mem <= self.scan_memory_threshold_bytes:
+                    block = min_block
+                else:
+                    free_mem = None
+                    mem_getter = getattr(torch.cuda, "mem_get_info", None)
+                    if mem_getter is not None:
+                        try:
+                            free_mem, _ = mem_getter(idx)
+                        except (AssertionError, RuntimeError):
+                            free_mem = None
+                    if free_mem:
+                        per_token = batch * self.num_heads * (3 * self.dk * self.dk + self.dk * self.dv) * element_size
+                        if per_token > 0:
+                            safe_bytes = max(1, int(free_mem * 0.15))
+                            est = max(1, safe_bytes // per_token)
+                            block = max(min_block, min(preferred, est))
+
+        return min(seq, max(min_block, block))
 
     def _use_scan(self, seq: int, device: torch.device) -> bool:
         if self.kda_mode == "scan":
