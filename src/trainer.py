@@ -135,12 +135,21 @@ def build_curriculum(train_cfg: dict, max_steps: int) -> List[dict]:
     return trimmed
 
 
-def auto_workers(use_gpu: bool) -> tuple[int, int | None]:
+def auto_workers(use_gpu: bool, seq_len: int = 1024) -> tuple[int, int | None]:
     if not use_gpu:
         return 0, None
     cpu_count = os.cpu_count() or 4
-    num_workers = min(12, max(4, cpu_count // 2))
-    prefetch = 4
+    # Reduce workers for shorter sequences to save GPU memory
+    # Shorter sequences = more batches in memory = need less CPU workers
+    if seq_len <= 256:
+        num_workers = min(4, max(2, cpu_count // 4))
+        prefetch = 2  # Less prefetching for memory-constrained scenarios
+    elif seq_len <= 512:
+        num_workers = min(6, max(3, cpu_count // 3))
+        prefetch = 3
+    else:
+        num_workers = min(12, max(4, cpu_count // 2))
+        prefetch = 4
     return num_workers, prefetch
 
 
@@ -154,7 +163,7 @@ def build_stage_loader(
     dataset = ChunkedDataset(texts, tokenizer, seq_len)
     batch_tokens = stage_cfg["batch_tokens"]
     batch_size = max(1, batch_tokens // seq_len)
-    num_workers, prefetch = auto_workers(use_gpu)
+    num_workers, prefetch = auto_workers(use_gpu, seq_len)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -315,6 +324,10 @@ def train(args: argparse.Namespace) -> None:
                 dataloader_iter = iter(dataloader)
                 batch = next(dataloader_iter)
 
+            # Clear cache before forward pass to free up memory
+            if use_gpu:
+                torch.cuda.empty_cache()
+            
             tokens = batch.tokens.to(device, non_blocking=use_gpu)
             targets = batch.targets.to(device, non_blocking=use_gpu)
 
@@ -330,6 +343,10 @@ def train(args: argparse.Namespace) -> None:
             epi_penalty = torch.tensor(model.episodic_gate_penalty(), device=device)
             total_loss = total_loss + loss_cfg.get("lambda_epi", 0.0) * epi_penalty
 
+            # Clear cache before backward to free up memory
+            if use_gpu:
+                torch.cuda.empty_cache()
+            
             if use_amp:
                 scaler.scale(total_loss / grad_accum).backward()
             else:
@@ -337,6 +354,7 @@ def train(args: argparse.Namespace) -> None:
             micro_step += 1
 
             if micro_step % grad_accum == 0:
+                # Clear cache before optimizer step to free memory
                 if use_gpu:
                     torch.cuda.empty_cache()
                 if use_amp:
@@ -349,7 +367,10 @@ def train(args: argparse.Namespace) -> None:
                     optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)  # More memory efficient
+                # Clear cache after optimizer step
+                if use_gpu:
+                    torch.cuda.empty_cache()
 
                 bonus = model.pred_head.curiosity_bonus(pred_out.error_trace)
                 logger.log(

@@ -42,20 +42,20 @@ train:
     curriculum:
       - steps: 20000
         seq_len: 256
-        batch_tokens: 4096          # batch_size=16 (was 64, causing OOM)
-        grad_accum: 16             # Reduced from 32
+        batch_tokens: 3072          # batch_size=12 (reduced from 16 for memory safety)
+        grad_accum: 16
       - steps: 20000
         seq_len: 512
-        batch_tokens: 5120          # batch_size=10 (was 24)
-        grad_accum: 16             # Reduced from 24
+        batch_tokens: 4096          # batch_size=8 (reduced from 10)
+        grad_accum: 16
       - steps: 30000
         seq_len: 768
-        batch_tokens: 4608          # batch_size=6 (was 10-11)
-        grad_accum: 20             # Reduced from 24
+        batch_tokens: 3840          # batch_size=5 (reduced from 6)
+        grad_accum: 20
       - steps: 50000
         seq_len: 1024
-        batch_tokens: 5120          # batch_size=5 (was 6)
-        grad_accum: 24             # Reduced from 32
+        batch_tokens: 4096          # batch_size=4 (reduced from 5)
+        grad_accum: 24
     lr_schedule:
       type: cosine
       warmup_steps: 3000
