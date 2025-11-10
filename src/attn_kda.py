@@ -320,28 +320,40 @@ class KDABlock(nn.Module):
         )
         active = (spike_tensor.abs().sum(dim=-1, keepdim=True) > 0).to(q.dtype)
 
-        block_tokens = self._select_scan_block_tokens(seq, bsz, device, q.element_size())
+        planned_block = self._select_scan_block_tokens(seq, bsz, device, q.element_size())
         outputs_chunks = []
         state = s
         emit_chunk_size = max(1, self.chunk_size)
+        adaptive_block = max(1, planned_block)
+        start = 0
 
-        for start in range(0, seq, block_tokens):
-            end = min(start + block_tokens, seq)
-            updates: KDAParallelUpdates = precompute_updates(
-                k[:, start:end],
-                v[:, start:end],
-                alpha[:, start:end],
-                beta[:, start:end],
-                active[:, start:end],
-                drop_mask[:, start:end] if drop_mask is not None else None,
-            )
-            chunk_outputs, state = scan_emit_outputs(
-                updates,
-                state,
-                q[:, start:end],
-                chunk_size=min(emit_chunk_size, end - start),
-            )
+        while start < seq:
+            current_block = min(adaptive_block, seq - start)
+            end = start + current_block
+            try:
+                updates: KDAParallelUpdates = precompute_updates(
+                    k[:, start:end],
+                    v[:, start:end],
+                    alpha[:, start:end],
+                    beta[:, start:end],
+                    active[:, start:end],
+                    drop_mask[:, start:end] if drop_mask is not None else None,
+                )
+                chunk_outputs, state = scan_emit_outputs(
+                    updates,
+                    state,
+                    q[:, start:end],
+                    chunk_size=min(emit_chunk_size, end - start),
+                )
+            except RuntimeError as exc:
+                if not self._is_cuda_oom(exc) or current_block <= 1:
+                    raise
+                adaptive_block = max(1, current_block // 2)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
             outputs_chunks.append(chunk_outputs)
+            start = end
 
         outputs = torch.cat(outputs_chunks, dim=1) if len(outputs_chunks) > 1 else outputs_chunks[0]
         outputs = self._apply_drop_outputs(outputs, drop_mask)
@@ -549,12 +561,14 @@ class KDABlock(nn.Module):
         device: torch.device,
         element_size: int,
     ) -> int:
-        min_block = max(1, self.chunk_size)
-        preferred = max(min_block, self.scan_min_len)
+        min_tokens = 1
+        chunk_floor = max(1, self.chunk_size)
+        preferred = max(chunk_floor, self.scan_min_len)
         if self.scan_block_override is not None:
-            return min(seq, max(min_block, self.scan_block_override))
+            return min(seq, max(min_tokens, self.scan_block_override))
 
         block = preferred
+        lowmem_cap = False
         if device.type == "cuda" and torch.cuda.is_available():
             try:
                 idx = device.index if device.index is not None else torch.cuda.current_device()
@@ -567,23 +581,37 @@ class KDABlock(nn.Module):
                 except (AssertionError, RuntimeError):
                     total_mem = None
                 if total_mem is not None and total_mem <= self.scan_memory_threshold_bytes:
-                    block = min_block
-                else:
-                    free_mem = None
-                    mem_getter = getattr(torch.cuda, "mem_get_info", None)
-                    if mem_getter is not None:
-                        try:
-                            free_mem, _ = mem_getter(idx)
-                        except (AssertionError, RuntimeError):
-                            free_mem = None
-                    if free_mem:
-                        per_token = batch * self.num_heads * (3 * self.dk * self.dk + self.dk * self.dv) * element_size
-                        if per_token > 0:
-                            safe_bytes = max(1, int(free_mem * 0.15))
-                            est = max(1, safe_bytes // per_token)
-                            block = max(min_block, min(preferred, est))
+                    lowmem_cap = True
+                    block = min(block, max(1, chunk_floor // 2))
+                free_mem = None
+                mem_getter = getattr(torch.cuda, "mem_get_info", None)
+                if mem_getter is not None:
+                    try:
+                        free_mem, _ = mem_getter(idx)
+                    except (AssertionError, RuntimeError):
+                        free_mem = None
+                if free_mem:
+                    per_token = self._estimate_scan_token_bytes(batch, element_size)
+                    if per_token > 0:
+                        frac = 0.1 if lowmem_cap else 0.2
+                        safe_bytes = max(1, int(free_mem * frac))
+                        est = safe_bytes // per_token
+                        if est > 0:
+                            block = max(1, min(block, est))
+                        else:
+                            block = 1
 
-        return min(seq, max(min_block, block))
+        return min(seq, max(min_tokens, block))
+
+    def _estimate_scan_token_bytes(self, batch: int, element_size: int) -> int:
+        mat_terms = 3 * self.dk * self.dk + 2 * self.dk * self.dv
+        per_token = batch * self.num_heads * mat_terms * max(1, element_size)
+        return max(1, per_token)
+
+    @staticmethod
+    def _is_cuda_oom(exc: RuntimeError) -> bool:
+        message = str(exc).lower()
+        return "out of memory" in message and ("cuda" in message or "cublas" in message or "cudnn" in message)
 
     def _use_scan(self, seq: int, device: torch.device) -> bool:
         if self.kda_mode == "scan":
