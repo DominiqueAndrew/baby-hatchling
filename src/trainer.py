@@ -11,15 +11,18 @@ from typing import Iterable, List, Sequence
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from .model import BabyHatchlingModel, build_model
+from .optim import AdaPM
 from .tokenizer import SentencePieceTokenizer
 from .utils.config import load_config
 from .utils.data import contamination_report, load_text_splits
 from .utils.logging import CSVLogger
+from .utils.sparsity import MSTSparsifier, SparsitySchedule, collect_sparse_modules
 
 
 @dataclass
@@ -82,12 +85,17 @@ def load_texts(specs: Sequence[dict]) -> List[str]:
 
 def build_curriculum(train_cfg: dict, max_steps: int) -> List[dict]:
     curriculum_cfg = train_cfg.get("curriculum")
+    default_seq = train_cfg.get("seq_len", curriculum_cfg[-1].get("seq_len") if curriculum_cfg else None)
+    default_btoks = train_cfg.get("batch_tokens", curriculum_cfg[-1].get("batch_tokens") if curriculum_cfg else None)
+    default_accum = train_cfg.get("grad_accum", curriculum_cfg[-1].get("grad_accum") if curriculum_cfg else 1)
+    if default_seq is None or default_btoks is None:
+        raise KeyError("Training config must set 'seq_len' and 'batch_tokens' when using curriculum.")
     if not curriculum_cfg:
         return [
             {
-                "seq_len": train_cfg["seq_len"],
-                "batch_tokens": train_cfg["batch_tokens"],
-                "grad_accum": train_cfg.get("grad_accum", 1),
+                "seq_len": default_seq,
+                "batch_tokens": default_btoks,
+                "grad_accum": default_accum,
                 "steps": max_steps,
             }
         ]
@@ -99,9 +107,9 @@ def build_curriculum(train_cfg: dict, max_steps: int) -> List[dict]:
             raise ValueError("Each curriculum stage must define 'steps'.")
         stages.append(
             {
-                "seq_len": stage.get("seq_len", train_cfg["seq_len"]),
-                "batch_tokens": stage.get("batch_tokens", train_cfg["batch_tokens"]),
-                "grad_accum": stage.get("grad_accum", train_cfg.get("grad_accum", 1)),
+                "seq_len": stage.get("seq_len", default_seq),
+                "batch_tokens": stage.get("batch_tokens", default_btoks),
+                "grad_accum": stage.get("grad_accum", default_accum),
                 "steps": stage_steps,
             }
         )
@@ -109,9 +117,9 @@ def build_curriculum(train_cfg: dict, max_steps: int) -> List[dict]:
     if consumed < max_steps:
         stages.append(
             {
-                "seq_len": train_cfg["seq_len"],
-                "batch_tokens": train_cfg["batch_tokens"],
-                "grad_accum": train_cfg.get("grad_accum", 1),
+                "seq_len": default_seq,
+                "batch_tokens": default_btoks,
+                "grad_accum": default_accum,
                 "steps": max_steps - consumed,
             }
         )
@@ -178,9 +186,32 @@ def build_scheduler(optimizer: torch.optim.Optimizer, lr_cfg: dict, total_steps:
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
+def build_optimizer(model: BabyHatchlingModel, optim_cfg: dict) -> torch.optim.Optimizer:
+    opt_type = optim_cfg.get("type", "adamw").lower()
+    if opt_type == "adapm":
+        return AdaPM(
+            model.parameters(),
+            lr=optim_cfg.get("lr", 2e-4),
+            beta=optim_cfg.get("beta", 0.9),
+            gamma=optim_cfg.get("gamma", 0.3),
+            eps=optim_cfg.get("eps", 1e-8),
+            weight_decay=optim_cfg.get("weight_decay", 0.0),
+        )
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=optim_cfg.get("lr", 2e-4),
+        betas=tuple(optim_cfg.get("betas", [0.9, 0.95])),
+        eps=optim_cfg.get("eps", 1e-8),
+        weight_decay=optim_cfg.get("weight_decay", 0.0),
+    )
+
+
 def train(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
-    train_cfg = cfg["train"]
+    train_block = cfg["train"]
+    stage_cfg = train_block.get(args.stage) or train_block.get("pretrain" if args.stage == "pretrain" else args.stage)
+    if stage_cfg is None:
+        raise KeyError(f"No training config found for stage '{args.stage}'.")
     optim_cfg = cfg["optim"]
     loss_cfg = cfg["loss"]
 
@@ -219,27 +250,36 @@ def train(args: argparse.Namespace) -> None:
         state = torch.load(args.load, map_location="cpu")
         model.load_state_dict(state, strict=False)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=optim_cfg["lr"],
-        betas=tuple(optim_cfg.get("betas", [0.9, 0.95])),
-        weight_decay=optim_cfg.get("weight_decay", 0.0),
-        eps=optim_cfg.get("eps", 1e-8),
-    )
+    optimizer = build_optimizer(model, optim_cfg)
 
-    grad_clip = train_cfg.get("grad_clip", 1.0)
-    max_steps = train_cfg.get("max_steps", 1000)
-    curriculum = build_curriculum(train_cfg, max_steps)
+    grad_clip = stage_cfg.get("grad_clip", 1.0)
+    max_steps = stage_cfg.get("max_steps", 1000)
+    curriculum = build_curriculum(stage_cfg, max_steps)
 
     logger = CSVLogger(Path("logs") / f"train_{args.stage}.csv", ["step", "loss", "lm", "pc", "epi", "bonus"])
-    scheduler = build_scheduler(optimizer, train_cfg.get("lr_schedule", {}), max_steps)
+    scheduler = build_scheduler(optimizer, stage_cfg.get("lr_schedule", {}), max_steps)
+
+    sparsifier = None
+    sparsity_cfg = stage_cfg.get("sparsity", {})
+    if sparsity_cfg.get("enabled"):
+        sparse_modules = collect_sparse_modules(model)
+        if sparse_modules:
+            schedule = SparsitySchedule(
+                warmup=sparsity_cfg.get("warmup", 0),
+                prune=sparsity_cfg.get("prune", 0),
+                restore=sparsity_cfg.get("restore", 0),
+                target=sparsity_cfg.get("target", 0.0),
+                update_every=sparsity_cfg.get("update_every", 1000),
+            )
+            sparsifier = MSTSparsifier(sparse_modules, schedule)
+            sparsifier.apply_masks()
 
     use_amp = use_gpu
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
     if use_amp:
         print("Using mixed precision training (FP16)")
 
-    early_cfg = train_cfg.get("early_stopping", {})
+    early_cfg = stage_cfg.get("early_stopping", {})
     use_early = early_cfg.get("enabled", False)
     patience = early_cfg.get("patience", 0)
     min_delta = early_cfg.get("min_delta", 0.0)
@@ -328,6 +368,8 @@ def train(args: argparse.Namespace) -> None:
                     torch.save(model.state_dict(), save_path)
 
                 step += 1
+                if sparsifier is not None:
+                    sparsifier.maybe_update(step)
                 stage_step += 1
                 progress.update(1)
 

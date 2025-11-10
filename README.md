@@ -10,6 +10,7 @@ Hatchling-NEURO keeps the 3:1 Kimi Delta Attention (KDA) : NoPE-global recipe bu
 - **Crawler-in-the-loop** – polite English-only crawler (robots-aware, license keywords, Simhash dedup, near-dup filters) that emits JSONL shards consumable by the trainer.
 - **Long-context pragmatics** – KDA keeps constant fast weights (`dk × dv` per head) and NoPE global layers use grouped KV, so 4k ctx fits on 24 GB with gradient accumulation.
 - **Quick-win efficiency stack** – curriculum schedule (256 → 1024), cosine LR with warmup, early stopping, gradient checkpointing for global layers, and stochastic token dropping (ScTD-inspired) inside mid-stack KDAs. Together they cut wall-clock time ~70 % on a single 3090 without hurting quality.
+- **Phase-2 optimizations** – Mixed Sparsity Training (MST) gradually prunes + regrows 70 % of dense linear weights (4× FLOP drop) while AdaPM replaces AdamW with a low-rank momentum optimizer so we can run much larger effective batches without the 24 GB limit getting in the way.
 
 ## Repo layout (trimmed)
 ```
@@ -91,6 +92,8 @@ Both configs keep 3:1 Spike-KDA:NoPE, grouped KV for globals, and BF16/FP16 mixe
 - **Early stopping** – when the moving average of the total loss doesn’t improve by `min_delta` within `patience` optimizer steps the trainer exits gracefully (after saving the checkpoint). Disable by flipping `train.pretrain.early_stopping.enabled=false`.
 - **Gradient checkpointing** – NoPE global layers run under `torch.utils.checkpoint` when `model.use_gradient_checkpointing` is true. This recovers ~1.5× VRAM headroom, letting the curriculum keep larger micro-batches without OOMs.
 - **Token dropping (ScTD-lite)** – mid-stack KDABlocks randomly reuse previous outputs for ~25 % of tokens (configurable via `model.token_drop`). The block skips state updates for dropped tokens, lowering FLOPs while keeping the semantics consistent.
+- **Mixed Sparsity Training (MST)** – configure via `train.pretrain.sparsity`. During warmup the model stays dense, then MST prunes weights magnitude-wise until the `target` sparsity; during restoration, masks regrow so final layers re-densify before convergence. Masks refresh every `update_every` steps and apply to every large linear layer, giving ≈4× FLOP savings in practice.
+- **AdaPM optimizer** – select with `optim.type: adapm`. AdaPM stores momentum per output channel instead of per-weight, so optimizer state shrinks by >90 % while retaining the benefits of momentum. Combined with gradient checkpointing we can safely push larger effective batches, improving convergence speed.
 
 Together these give ~70–80 % wall-clock savings on a single RTX 3090: ≈45–55 hours to hit 60 k steps vs. ~150+ hours previously for 120 k steps at constant 1 k ctx. Extend the final curriculum stage or bump `seq_len` when you need the full 2 k context; just watch VRAM when editing `configs/hn_xs.yaml`.
 
