@@ -4,6 +4,7 @@ Hatchling-NEURO keeps the 3:1 Kimi Delta Attention (KDA) : NoPE-global recipe bu
 
 ## Highlights
 - **Spike-KDA stacks** – every three Spike-modulated KDA blocks are followed by a NoPE global attention block (MQA/GQA friendly). LIF spikes modulate the per-channel decay `α_t` and write step `β_t`, enabling compute skipping when heads are silent.
+- **Parallel-Scan Spike-KDA** – log-depth upsweep/downsweep fast weight accumulation via `model.kda_mode: "scan"` keeps training fully parallel on GPU while autoregressive decoding automatically falls back to the sequential kernel.
 - **Predictive coding + curiosity** – tied-embedding LM head plus a stop-grad next-state head. Errors feed a curiosity bonus and optional episodic writes.
 - **Tiny episodic memory** – SQLite + FAISS store with write-on-surprise / read-on-uncertainty gates and a differentiable penalty to keep accesses controlled.
 - **Verifiable micro-RLVR** – PPO-lite with truncated importance weights, dynamic KL penalties, and sandboxed unit tests for GSM8K-mini and HumanEval/EvalPlus-mini.
@@ -39,6 +40,32 @@ baby-hatchling/
     test_kda.py           # streaming vs. full pass equivalence
     test_nope.py, test_episodic.py, test_rlvr_math.py, test_data_loader.py …
 ```
+
+## Parallel-Scan Spike-KDA
+- `model.kda_mode` switches between `"sequential"`, `"chunked"`, `"scan"`, and `"auto"` (auto = try scan on GPU w/ `seq_len ≥ model.kda_scan_min_len`, otherwise fall back).
+- `model.kda_scan_min_len` (default 64) avoids scan overhead on very short contexts.
+- Scan mode parallelizes the Spike-KDA fast-weight recurrence with a Blelloch prefix algorithm (`precompute_updates → parallel_scan → emit_outputs`). Autoregressive decoding still uses the sequential path; set `model.kda_mode: "auto"` if you want CPU batches to fall back automatically.
+- Full derivation plus kernel notes live in `docs/parallel_scan_spike_kda.md`.
+
+Quick benchmark recipe (PyTorch 2.2+):
+
+```python
+import torch, torch.utils.benchmark as bench
+from src.attn_kda import KDABlock
+
+block = KDABlock(512, 8, 64, 64, 2048, 256, kda_mode="scan").cuda()
+x = torch.randn(2, 1024, 512, device="cuda", dtype=torch.float16, requires_grad=True)
+
+def run(mode):
+    block.kda_mode = mode
+    y, _ = block(x)
+    (y.sum()).backward()
+
+for mode in ["sequential", "scan"]:
+    print(bench.Timer(stmt="run(mode)", globals={"run": run, "mode": mode}).blocked_autorange())
+```
+
+Expect the scan path to close most of the gap between sequential KDA and full attention for long sequences while preserving the same numerics (validated in `tests/test_kda.py`).
 
 ## Environment
 ```bash

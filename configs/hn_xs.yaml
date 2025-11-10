@@ -21,6 +21,8 @@ model:
   use_curiosity_bonus: true
   use_gradient_checkpointing: true  # Re-enabled with optimizations
   kda_chunk_size: 16                # Chunk size for KDA parallel processing (8-32 recommended)
+  kda_mode: scan                    # use Blelloch parallel scan on GPU
+  kda_scan_min_len: 64
   token_drop:
     enabled: true                    # Re-enabled with optimizations
     prob: 0.25

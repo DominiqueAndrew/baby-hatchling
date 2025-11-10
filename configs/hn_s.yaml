@@ -19,6 +19,8 @@ model:
   use_predictive_head: true
   use_episodic_memory: true
   use_curiosity_bonus: true
+  kda_mode: scan
+  kda_scan_min_len: 64
 train:
   pretrain:
     seq_len: 4096

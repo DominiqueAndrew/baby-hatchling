@@ -37,6 +37,8 @@ class ModelConfig:
     use_curiosity_bonus: bool = True
     use_gradient_checkpointing: bool = False
     kda_chunk_size: int = 16
+    kda_mode: str = "sequential"
+    kda_scan_min_len: int = 64
     token_drop: Optional[dict] = None
 
 
@@ -78,6 +80,8 @@ class BabyHatchlingModel(nn.Module):
                     spike_surrogate_beta=cfg.spike_surrogate_beta,
                     token_drop_prob=layer_drop_prob,
                     chunk_size=getattr(cfg, 'kda_chunk_size', 16),
+                    kda_mode=getattr(cfg, 'kda_mode', "sequential"),
+                    scan_min_len=getattr(cfg, 'kda_scan_min_len', 64),
                 )
                 self.kda_positions.append(idx)
             self.layers.append(block)
