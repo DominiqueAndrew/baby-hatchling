@@ -21,6 +21,7 @@ model:
   use_curiosity_bonus: true
   kda_mode: scan
   kda_scan_min_len: 64
+  kda_memory_chunk_size: 64
 train:
   pretrain:
     seq_len: 4096

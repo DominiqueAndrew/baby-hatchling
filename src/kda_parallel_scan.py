@@ -24,6 +24,7 @@ def precompute_updates(
     beta: torch.Tensor,
     active: torch.Tensor,
     drop_mask: Optional[torch.Tensor] = None,
+    memory_chunk_size: int = 64,
 ) -> KDAParallelUpdates:
     """Builds per-token transition and write matrices.
 
@@ -34,6 +35,7 @@ def precompute_updates(
     beta: Write factors [B,T,H,1].
     active: Binary indicator per head [B,T,H,1].
     drop_mask: Optional bool tensor [B,T] for token dropping.
+    memory_chunk_size: Number of tokens to process at once (lower = less memory, slower).
     """
 
     alpha_eff = torch.where(active > 0, alpha, torch.ones_like(alpha))
@@ -46,14 +48,38 @@ def precompute_updates(
         alpha_eff = torch.where(token_keep_alpha > 0, alpha_eff, torch.ones_like(alpha_eff))
         beta_eff = beta_eff * token_keep_beta
 
-    alpha_k = alpha_eff * k
-    writes = torch.matmul(k.unsqueeze(-1), v.unsqueeze(-2))
-    writes = beta_eff.unsqueeze(-1) * writes
-
-    decay_diag = torch.diag_embed(alpha_eff)
-    forget_rank1 = torch.matmul(k.unsqueeze(-1), alpha_k.unsqueeze(-2))
-    forget_rank1 = beta_eff.unsqueeze(-1) * forget_rank1
-    transitions = decay_diag - forget_rank1
+    # Memory-efficient computation: process in chunks to avoid OOM
+    # Instead of materializing full [B,T,H,dk,dk] tensors at once
+    bsz, seq, heads, dk = alpha_eff.shape
+    dv = v.shape[-1]
+    chunk_size = min(memory_chunk_size, seq)  # Process in configurable chunks
+    transitions_list = []
+    writes_list = []
+    
+    alpha_k = alpha_eff * k  # This is [B,T,H,dk], relatively small
+    
+    for start in range(0, seq, chunk_size):
+        end = min(start + chunk_size, seq)
+        alpha_chunk = alpha_eff[:, start:end]
+        alpha_k_chunk = alpha_k[:, start:end]
+        beta_chunk = beta_eff[:, start:end]
+        k_chunk = k[:, start:end]
+        v_chunk = v[:, start:end]
+        
+        # Compute writes for this chunk
+        writes_chunk = torch.matmul(k_chunk.unsqueeze(-1), v_chunk.unsqueeze(-2))
+        writes_chunk = beta_chunk.unsqueeze(-1) * writes_chunk
+        writes_list.append(writes_chunk)
+        
+        # Compute transitions for this chunk
+        decay_diag = torch.diag_embed(alpha_chunk)
+        forget_rank1 = torch.matmul(k_chunk.unsqueeze(-1), alpha_k_chunk.unsqueeze(-2))
+        forget_rank1 = beta_chunk.unsqueeze(-1) * forget_rank1
+        transitions_chunk = decay_diag - forget_rank1
+        transitions_list.append(transitions_chunk)
+    
+    transitions = torch.cat(transitions_list, dim=1)
+    writes = torch.cat(writes_list, dim=1)
 
     return KDAParallelUpdates(transitions=transitions, writes=writes, drop_mask=drop_mask)
 
@@ -129,15 +155,17 @@ def _blelloch_exclusive_scan(
     device = transitions.device
     dtype = transitions.dtype
 
-    arr_m = transitions.clone()
-    arr_b = writes.clone()
-
+    # Avoid unnecessary clones - work in-place when possible
     if pad_len > 0:
         eye = torch.eye(dk, device=device, dtype=dtype).view(1, 1, 1, dk, dk)
-        eye = eye.expand(bsz, pad_len, heads, dk, dk).clone()
+        eye = eye.expand(bsz, pad_len, heads, dk, dk).contiguous()
         zero = torch.zeros(bsz, pad_len, heads, dk, dv, device=device, dtype=writes.dtype)
-        arr_m = torch.cat([arr_m, eye], dim=1)
-        arr_b = torch.cat([arr_b, zero], dim=1)
+        arr_m = torch.cat([transitions, eye], dim=1)
+        arr_b = torch.cat([writes, zero], dim=1)
+    else:
+        # No padding needed - clone only once
+        arr_m = transitions.clone()
+        arr_b = writes.clone()
     levels = int(math.log2(pow2)) if pow2 > 1 else 0
 
     for level in range(levels):

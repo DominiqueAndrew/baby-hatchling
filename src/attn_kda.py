@@ -52,6 +52,7 @@ class KDABlock(nn.Module):
         chunk_size: int = 16,
         kda_mode: str = "sequential",
         scan_min_len: int = 64,
+        memory_chunk_size: int = 64,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -62,6 +63,7 @@ class KDABlock(nn.Module):
         self.chunk_size = chunk_size
         self.kda_mode = kda_mode.lower()
         self.scan_min_len = max(1, scan_min_len)
+        self.memory_chunk_size = max(1, memory_chunk_size)
         if self.kda_mode not in {"sequential", "chunked", "scan", "auto"}:
             raise ValueError(f"Unsupported kda_mode '{kda_mode}'.")
 
@@ -305,7 +307,9 @@ class KDABlock(nn.Module):
         )
         active = (spike_tensor.abs().sum(dim=-1, keepdim=True) > 0).to(q.dtype)
 
-        updates: KDAParallelUpdates = precompute_updates(k, v, alpha, beta, active, drop_mask)
+        updates: KDAParallelUpdates = precompute_updates(
+            k, v, alpha, beta, active, drop_mask, memory_chunk_size=self.memory_chunk_size
+        )
         outputs, final_state = scan_emit_outputs(
             updates,
             s,
