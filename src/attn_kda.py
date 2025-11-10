@@ -125,7 +125,8 @@ class KDABlock(nn.Module):
             guard = min(2, seq)
             drop_mask[:, :guard] = False
             drop_mask[:, -guard:] = False
-            self.last_drop_fraction = float(drop_mask.float().mean().item())
+            # Avoid synchronous .item() call - keep on GPU
+            self.last_drop_fraction = drop_mask.float().mean()  # Keep as tensor, no .item()
         else:
             self.last_drop_fraction = 0.0
         prev_out = None

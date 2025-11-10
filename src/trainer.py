@@ -327,10 +327,6 @@ def train(args: argparse.Namespace) -> None:
                 dataloader_iter = iter(dataloader)
                 batch = next(dataloader_iter)
 
-            # Clear cache before forward pass to free up memory
-            if use_gpu:
-                torch.cuda.empty_cache()
-            
             tokens = batch.tokens.to(device, non_blocking=use_gpu)
             targets = batch.targets.to(device, non_blocking=use_gpu)
 
@@ -345,10 +341,6 @@ def train(args: argparse.Namespace) -> None:
             total_loss = lm_loss + lambda_pc * pred_out.pc_loss
             epi_penalty = torch.tensor(model.episodic_gate_penalty(), device=device)
             total_loss = total_loss + loss_cfg.get("lambda_epi", 0.0) * epi_penalty
-
-            # Clear cache before backward to free up memory
-            if use_gpu:
-                torch.cuda.empty_cache()
             
             if use_amp:
                 scaler.scale(total_loss / grad_accum).backward()
@@ -357,9 +349,6 @@ def train(args: argparse.Namespace) -> None:
             micro_step += 1
 
             if micro_step % grad_accum == 0:
-                # Clear cache before optimizer step to free memory
-                if use_gpu:
-                    torch.cuda.empty_cache()
                 if use_amp:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -373,21 +362,26 @@ def train(args: argparse.Namespace) -> None:
                 if scheduler is not None:
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)  # More memory efficient
-                # Clear cache after optimizer step
-                if use_gpu:
+                # Only clear cache every 100 steps to avoid slowdown from synchronous calls
+                if use_gpu and step % 100 == 0:
                     torch.cuda.empty_cache()
 
-                bonus = model.pred_head.curiosity_bonus(pred_out.error_trace)
-                logger.log(
-                    {
-                        "step": step,
-                        "loss": float(total_loss.item()),
-                        "lm": float(lm_loss.item()),
-                        "pc": float(pred_out.pc_loss.item()),
-                        "epi": float(epi_penalty.item()),
-                        "bonus": bonus,
-                    }
-                )
+                # Log and compute metrics (these require .item() which is synchronous, so do it infrequently)
+                # But keep the tensors for now to avoid sync on every step
+                
+                # Save logs every 10 steps
+                if step % 10 == 0:
+                    bonus = model.pred_head.curiosity_bonus(pred_out.error_trace)
+                    logger.log(
+                        {
+                            "step": step,
+                            "loss": float(total_loss.item()),
+                            "lm": float(lm_loss.item()),
+                            "pc": float(pred_out.pc_loss.item()),
+                            "epi": float(epi_penalty.item()),
+                            "bonus": bonus,
+                        }
+                    )
                 # Save checkpoint every 1000 steps instead of every step to avoid massive slowdown
                 if args.save and (step % 1000 == 0 or step == max_steps - 1):
                     save_path = Path(args.save)
@@ -402,13 +396,14 @@ def train(args: argparse.Namespace) -> None:
                 stage_step += 1
                 progress.update(1)
 
-                if use_early:
+                # Early stopping check - only every 100 steps to avoid sync overhead
+                if use_early and step % 100 == 0:
                     current = float(total_loss.item())
                     if current < best_loss - min_delta:
                         best_loss = current
                         steps_since_improve = 0
                     else:
-                        steps_since_improve += 1
+                        steps_since_improve += 100
                         if steps_since_improve >= patience:
                             print("\n⏹ Early stopping triggered.")
                             break
