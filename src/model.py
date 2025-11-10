@@ -39,6 +39,7 @@ class ModelConfig:
     kda_chunk_size: int = 16
     kda_mode: str = "sequential"
     kda_scan_min_len: int = 64
+    kda_memory_chunk_size: int = 64
     token_drop: Optional[dict] = None
 
 
