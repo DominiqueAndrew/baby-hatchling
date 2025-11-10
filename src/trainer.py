@@ -153,15 +153,28 @@ def train(args: argparse.Namespace) -> None:
         seq_len = train_cfg["seq_len"]
         
         # More aggressive reduction for longer sequences
+        # Also consider model size (d_model) for memory estimation
+        model_d_model = cfg["model"].get("d_model", 512)
+        model_n_layers = cfg["model"].get("n_layers", 16)
+        
+        # Base reduction on sequence length
         if seq_len >= 2048:
             # For very long sequences, use 25% of calculated batch size
             batch_size = max(1, initial_batch_size // 4)
         elif seq_len >= 1024:
             # For medium sequences, use 50% of calculated batch size
             batch_size = max(1, initial_batch_size // 2)
+        elif seq_len >= 512:
+            # For medium-short sequences, use 60% of calculated batch size
+            batch_size = max(1, int(initial_batch_size * 0.6))
         else:
             # For shorter sequences, use 75% of calculated batch size
             batch_size = max(1, int(initial_batch_size * 0.75))
+        
+        # Additional reduction for large models
+        if model_d_model >= 640 or model_n_layers >= 24:
+            batch_size = max(1, batch_size // 2)
+            print(f"⚠️  Further reduced batch size to {batch_size} due to large model size (d_model={model_d_model}, layers={model_n_layers})")
         
         # Additional reduction based on total GPU memory
         if total_memory < 20:

@@ -2,28 +2,28 @@ seed: 17
 threads: 16
 model:
   name: hn_xs
-  d_model: 640
-  n_layers: 24            # 18 Spike-KDA + 6 NoPE global (3:1)
+  d_model: 512            # Reduced from 640 to save memory
+  n_layers: 16            # Reduced from 24 (12 Spike-KDA + 4 NoPE global)
   n_heads: 8
   dk: 64
   dv: 64
-  d_ff: 2560
+  d_ff: 2048              # Reduced from 2560 to save memory
   rank_gate: 256
   group_kv: 1
   gw_tokens: 0
-  max_seq: 4096
+  max_seq: 2048            # Reduced from 4096
   spike_decay: 0.92
   spike_threshold: 0.35
   spike_surrogate_beta: 9.0
-  episodic_bytes: 33554432
+  episodic_bytes: 16777216  # Reduced from 32MB to 16MB
   use_predictive_head: true
   use_episodic_memory: true
   use_curiosity_bonus: true
 train:
   pretrain:
-    seq_len: 896
-    batch_tokens: 4096
-    grad_accum: 32
+    seq_len: 512            # Reduced from 896 for memory safety
+    batch_tokens: 2048      # Reduced from 4096
+    grad_accum: 64          # Increased to maintain effective batch size
     grad_clip: 1.0
     max_steps: 120000
   sft:
