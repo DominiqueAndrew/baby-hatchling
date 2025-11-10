@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from .modules import HeadwiseRMSNorm, LIFSpike, RMSNorm, SwiGLU, depthwise_short_conv
-from .kda_parallel_scan import KDAParallelUpdates, emit_outputs, parallel_scan, precompute_updates
+from .kda_parallel_scan import KDAParallelUpdates, precompute_updates, scan_emit_outputs
 
 
 @dataclass
@@ -306,8 +306,12 @@ class KDABlock(nn.Module):
         active = (spike_tensor.abs().sum(dim=-1, keepdim=True) > 0).to(q.dtype)
 
         updates: KDAParallelUpdates = precompute_updates(k, v, alpha, beta, active, drop_mask)
-        states, final_state = parallel_scan(updates, s)
-        outputs = emit_outputs(states, q)
+        outputs, final_state = scan_emit_outputs(
+            updates,
+            s,
+            q,
+            chunk_size=max(1, self.chunk_size),
+        )
         outputs = self._apply_drop_outputs(outputs, drop_mask)
         return outputs, final_state, spike_mem
 

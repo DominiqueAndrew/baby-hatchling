@@ -58,33 +58,46 @@ def precompute_updates(
     return KDAParallelUpdates(transitions=transitions, writes=writes, drop_mask=drop_mask)
 
 
-def parallel_scan(
+def scan_emit_outputs(
     updates: KDAParallelUpdates,
     initial_state: torch.Tensor,
+    q: torch.Tensor,
+    *,
+    chunk_size: int = 64,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Runs a Blelloch-style scan over the sequence.
+    """Runs scan and emits outputs without materializing all states at once.
 
-    Returns
-    -------
-    states: Tensor [B,T,H,dk,dv] with the post-token fast weights.
-    final_state: Tensor [B,H,dk,dv] from the last token.
+    Parameters
+    ----------
+    updates: Precomputed transition/write tensors.
+    initial_state: Fast weight state before the sequence, [B,H,dk,dv].
+    q: Query tensor [B,T,H,dk].
+    chunk_size: Number of tokens to materialize at a time while emitting.
     """
 
     prefix_m, prefix_b = _blelloch_exclusive_scan(updates.transitions, updates.writes)
     bsz, seq, heads, dk, dv = updates.writes.shape
 
-    s0 = initial_state.unsqueeze(1).expand(-1, seq, -1, -1, -1)
-    prior = torch.matmul(prefix_m, s0) + prefix_b
-    states = torch.matmul(updates.transitions, prior) + updates.writes
-    final_state = states[:, -1]
-    return states, final_state
+    if chunk_size <= 0:
+        chunk_size = seq
 
+    outputs = []
+    final_state = None
+    s0 = initial_state.unsqueeze(1)  # [B,1,H,dk,dv]
 
-def emit_outputs(states: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-    """Computes outputs o_t = S_t^T q_t for all tokens in parallel."""
+    for start in range(0, seq, chunk_size):
+        end = min(start + chunk_size, seq)
+        m_chunk = prefix_m[:, start:end]  # [B,C,H,dk,dk]
+        b_chunk = prefix_b[:, start:end]
+        prior = torch.matmul(m_chunk, s0) + b_chunk
+        state_chunk = torch.matmul(updates.transitions[:, start:end], prior) + updates.writes[:, start:end]
 
-    q_expanded = q.unsqueeze(-2)
-    return (q_expanded * states).sum(dim=-2)
+        q_chunk = q[:, start:end].unsqueeze(-2)
+        outputs.append((q_chunk * state_chunk).sum(dim=-2))
+        final_state = state_chunk[:, -1]
+
+    outputs_tensor = torch.cat(outputs, dim=1)
+    return outputs_tensor, final_state
 
 
 def _combine_transforms(

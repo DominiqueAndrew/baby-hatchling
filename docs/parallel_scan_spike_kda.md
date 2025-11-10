@@ -60,8 +60,9 @@ The GPU path is broken into three clearly separated passes:
    - Applies each prefix operator to the initial state \(S_0\) and then applies the token’s own `(A_t, B_t)` to obtain all `S_t`.  
    - Implemented with batched `torch.matmul`, padded to the next power-of-two, and works on CUDA/MPS/XPU. CPU automatically falls back to the sequential core.
 
-3. **`emit_outputs`**  
-   - Computes \(o_t = S_t^\top q_t\) in parallel via a single batched contraction.  
+3. **`scan_emit_outputs`**  
+   - Performs the downsweep in tiles of `chunk_size` tokens: `(prefix_m, prefix_b)` are sliced, converted into local states, immediately contracted with `q`, then released.  
+   - Keeps peak memory close to `chunk_size × H × d_k × d_v` regardless of the full sequence length while still emitting all tokens in parallel from the caller’s perspective.  
    - Token-drop forward-fills outputs using a cummax-based gather so dropped tokens reuse the last emitted vector.
 
 The scan path sits behind `KDABlock._forward_parallel_scan` and is selected when `model.kda_mode in {"scan","auto"}` *and* the device is CUDA/XPU/MPS with `seq_len ≥ model.kda_scan_min_len`. Autoregressive streaming automatically reuses the sequential kernel.

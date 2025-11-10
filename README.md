@@ -44,7 +44,7 @@ baby-hatchling/
 ## Parallel-Scan Spike-KDA
 - `model.kda_mode` switches between `"sequential"`, `"chunked"`, `"scan"`, and `"auto"` (auto = try scan on GPU w/ `seq_len ≥ model.kda_scan_min_len`, otherwise fall back).
 - `model.kda_scan_min_len` (default 64) avoids scan overhead on very short contexts.
-- Scan mode parallelizes the Spike-KDA fast-weight recurrence with a Blelloch prefix algorithm (`precompute_updates → parallel_scan → emit_outputs`). Autoregressive decoding still uses the sequential path; set `model.kda_mode: "auto"` if you want CPU batches to fall back automatically.
+- Scan mode parallelizes the Spike-KDA fast-weight recurrence with a Blelloch prefix algorithm (`precompute_updates → scan_emit_outputs`). Outputs stream out in tiles of `model.kda_chunk_size` tokens so we never materialize the entire `[B,T,H,dk,dv]` state (keeps VRAM roughly flat vs. sequence length). Autoregressive decoding still uses the sequential path; set `model.kda_mode: "auto"` if you want CPU batches to fall back automatically.
 - Full derivation plus kernel notes live in `docs/parallel_scan_spike_kda.md`.
 
 Quick benchmark recipe (PyTorch 2.2+):
