@@ -52,7 +52,6 @@ class KDABlock(nn.Module):
         chunk_size: int = 16,
         kda_mode: str = "sequential",
         scan_min_len: int = 64,
-        memory_chunk_size: int = 64,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
@@ -63,7 +62,6 @@ class KDABlock(nn.Module):
         self.chunk_size = chunk_size
         self.kda_mode = kda_mode.lower()
         self.scan_min_len = max(1, scan_min_len)
-        self.memory_chunk_size = max(1, memory_chunk_size)
         if self.kda_mode not in {"sequential", "chunked", "scan", "auto"}:
             raise ValueError(f"Unsupported kda_mode '{kda_mode}'.")
 
@@ -307,17 +305,32 @@ class KDABlock(nn.Module):
         )
         active = (spike_tensor.abs().sum(dim=-1, keepdim=True) > 0).to(q.dtype)
 
-        updates: KDAParallelUpdates = precompute_updates(
-            k, v, alpha, beta, active, drop_mask, memory_chunk_size=self.memory_chunk_size
-        )
-        outputs, final_state = scan_emit_outputs(
-            updates,
-            s,
-            q,
-            chunk_size=max(1, self.chunk_size),
-        )
+        block_tokens = max(1, min(seq, max(self.scan_min_len, self.chunk_size)))
+        outputs_chunks = []
+        state = s
+        emit_chunk_size = max(1, self.chunk_size)
+
+        for start in range(0, seq, block_tokens):
+            end = min(start + block_tokens, seq)
+            updates: KDAParallelUpdates = precompute_updates(
+                k[:, start:end],
+                v[:, start:end],
+                alpha[:, start:end],
+                beta[:, start:end],
+                active[:, start:end],
+                drop_mask[:, start:end] if drop_mask is not None else None,
+            )
+            chunk_outputs, state = scan_emit_outputs(
+                updates,
+                state,
+                q[:, start:end],
+                chunk_size=min(emit_chunk_size, end - start),
+            )
+            outputs_chunks.append(chunk_outputs)
+
+        outputs = torch.cat(outputs_chunks, dim=1) if len(outputs_chunks) > 1 else outputs_chunks[0]
         outputs = self._apply_drop_outputs(outputs, drop_mask)
-        return outputs, final_state, spike_mem
+        return outputs, state, spike_mem
 
     def _parallel_scan_chunk(
         self,

@@ -39,7 +39,6 @@ class ModelConfig:
     kda_chunk_size: int = 16
     kda_mode: str = "sequential"
     kda_scan_min_len: int = 64
-    kda_memory_chunk_size: int = 64
     token_drop: Optional[dict] = None
 
 
@@ -83,7 +82,6 @@ class BabyHatchlingModel(nn.Module):
                     chunk_size=getattr(cfg, 'kda_chunk_size', 16),
                     kda_mode=getattr(cfg, 'kda_mode', "sequential"),
                     scan_min_len=getattr(cfg, 'kda_scan_min_len', 64),
-                    memory_chunk_size=getattr(cfg, 'kda_memory_chunk_size', 64),
                 )
                 self.kda_positions.append(idx)
             self.layers.append(block)
