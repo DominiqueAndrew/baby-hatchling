@@ -19,9 +19,9 @@ model:
   use_predictive_head: true
   use_episodic_memory: false        # Disabled - causes 10-20x slowdown due to GPU→CPU transfers
   use_curiosity_bonus: true
-  use_gradient_checkpointing: true
+  use_gradient_checkpointing: false  # Temporarily disabled to test if it's causing slowdown
   token_drop:
-    enabled: true
+    enabled: false                    # Temporarily disabled to test if it's causing slowdown
     prob: 0.25
     min_layer: 4
     max_layer: 14
@@ -33,7 +33,7 @@ train:
     grad_clip: 1.0
     max_steps: 60000               # Reduced from 120000 (50% reduction with optimizations)
     sparsity:
-      enabled: true
+      enabled: false                # Temporarily disabled to test if it's causing slowdown
       target: 0.7
       warmup: 5000                 # Reduced from 10000
       prune: 20000                 # Reduced from 40000
