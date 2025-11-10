@@ -79,6 +79,14 @@ class KDABlock(nn.Module):
                 self.scan_block_override = None
         else:
             self.scan_block_override = None
+        batch_override = os.environ.get("KDA_SCAN_BATCH_BLOCK")
+        if batch_override is not None:
+            try:
+                self.scan_batch_block_override = max(1, int(batch_override))
+            except ValueError:
+                self.scan_batch_block_override = None
+        else:
+            self.scan_batch_block_override = None
 
         self.norm_in = RMSNorm(d_model)
         self.short_conv = depthwise_short_conv(d_model)
@@ -321,6 +329,7 @@ class KDABlock(nn.Module):
         active = (spike_tensor.abs().sum(dim=-1, keepdim=True) > 0).to(q.dtype)
 
         planned_block = self._select_scan_block_tokens(seq, bsz, device, q.element_size())
+        batch_block = self._select_scan_batch_block(bsz, device)
         outputs_chunks = []
         state = s
         emit_chunk_size = max(1, self.chunk_size)
@@ -330,29 +339,74 @@ class KDABlock(nn.Module):
         while start < seq:
             current_block = min(adaptive_block, seq - start)
             end = start + current_block
-            try:
-                updates: KDAParallelUpdates = precompute_updates(
-                    k[:, start:end],
-                    v[:, start:end],
-                    alpha[:, start:end],
-                    beta[:, start:end],
-                    active[:, start:end],
-                    drop_mask[:, start:end] if drop_mask is not None else None,
+            block_outputs = None
+            pending_states = None
+            block_completed = False
+            while not block_completed:
+                block_outputs = torch.empty(
+                    bsz,
+                    current_block,
+                    self.num_heads,
+                    self.dv,
+                    device=q.device,
+                    dtype=q.dtype,
                 )
-                chunk_outputs, state = scan_emit_outputs(
-                    updates,
-                    state,
-                    q[:, start:end],
-                    chunk_size=min(emit_chunk_size, end - start),
-                )
-            except RuntimeError as exc:
-                if not self._is_cuda_oom(exc) or current_block <= 1:
-                    raise
-                adaptive_block = max(1, current_block // 2)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                pending_states = []
+                block_failed = False
+                restart_with_smaller_tokens = False
+                b_start = 0
+                while b_start < bsz:
+                    b_end = min(b_start + batch_block, bsz)
+                    try:
+                        updates: KDAParallelUpdates = precompute_updates(
+                            k[b_start:b_end, start:end],
+                            v[b_start:b_end, start:end],
+                            alpha[b_start:b_end, start:end],
+                            beta[b_start:b_end, start:end],
+                            active[b_start:b_end, start:end],
+                            drop_mask[b_start:b_end, start:end] if drop_mask is not None else None,
+                        )
+                        chunk_outputs, new_state = scan_emit_outputs(
+                            updates,
+                            state[b_start:b_end],
+                            q[b_start:b_end, start:end],
+                            chunk_size=min(emit_chunk_size, end - start),
+                        )
+                    except RuntimeError as exc:
+                        if not self._is_cuda_oom(exc):
+                            raise
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        if batch_block > 1:
+                            batch_block = max(1, batch_block // 2)
+                            block_failed = True
+                            break
+                        if current_block > 1:
+                            adaptive_block = max(1, current_block // 2)
+                            restart_with_smaller_tokens = True
+                            block_failed = True
+                            break
+                        raise
+                    block_outputs[b_start:b_end] = chunk_outputs
+                    pending_states.append((b_start, b_end, new_state))
+                    b_start = b_end
+
+                if block_failed:
+                    block_outputs = None
+                    pending_states = None
+                    if restart_with_smaller_tokens:
+                        break
+                    continue
+
+                block_completed = True
+
+            if not block_completed:
+                # We reduced token block size; retry with new adaptive_block.
                 continue
-            outputs_chunks.append(chunk_outputs)
+
+            for b_start, b_end, new_state in pending_states:
+                state[b_start:b_end] = new_state
+            outputs_chunks.append(block_outputs)
             start = end
 
         outputs = torch.cat(outputs_chunks, dim=1) if len(outputs_chunks) > 1 else outputs_chunks[0]
@@ -602,6 +656,28 @@ class KDABlock(nn.Module):
                             block = 1
 
         return min(seq, max(min_tokens, block))
+
+    def _select_scan_batch_block(self, batch: int, device: torch.device) -> int:
+        if batch <= 1:
+            return 1
+        if self.scan_batch_block_override is not None:
+            return min(batch, max(1, self.scan_batch_block_override))
+
+        block = batch
+        if device.type == "cuda" and torch.cuda.is_available():
+            try:
+                idx = device.index if device.index is not None else torch.cuda.current_device()
+            except RuntimeError:
+                idx = None
+            if idx is not None:
+                total_mem = None
+                try:
+                    total_mem = torch.cuda.get_device_properties(idx).total_memory
+                except (AssertionError, RuntimeError):
+                    total_mem = None
+                if total_mem is not None and total_mem <= self.scan_memory_threshold_bytes:
+                    block = max(1, min(batch, batch // 4 or 1))
+        return block
 
     def _estimate_scan_token_bytes(self, batch: int, element_size: int) -> int:
         mat_terms = 3 * self.dk * self.dk + 2 * self.dk * self.dv
