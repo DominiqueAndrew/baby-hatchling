@@ -6,6 +6,7 @@ from typing import List, Optional
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from .attn_kda import KDAState, KDABlock
 from .episodic_mem import EpisodicMemory
@@ -34,6 +35,8 @@ class ModelConfig:
     use_predictive_head: bool = True
     use_episodic_memory: bool = True
     use_curiosity_bonus: bool = True
+    use_gradient_checkpointing: bool = False
+    token_drop: Optional[dict] = None
 
 
 class BabyHatchlingModel(nn.Module):
@@ -44,6 +47,11 @@ class BabyHatchlingModel(nn.Module):
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
         self.layers = nn.ModuleList()
         self.kda_positions: List[int] = []
+        drop_cfg = cfg.token_drop or {}
+        drop_enabled = drop_cfg.get("enabled", False)
+        drop_prob = drop_cfg.get("prob", 0.0)
+        drop_min = drop_cfg.get("min_layer", 0)
+        drop_max = drop_cfg.get("max_layer", cfg.n_layers)
         for idx in range(cfg.n_layers):
             if (idx + 1) % 4 == 0:
                 block = GlobalNoPEBlock(
@@ -56,6 +64,7 @@ class BabyHatchlingModel(nn.Module):
                     gw_tokens=cfg.gw_tokens,
                 )
             else:
+                layer_drop_prob = drop_prob if (drop_enabled and drop_min <= idx < drop_max) else 0.0
                 block = KDABlock(
                     d_model=cfg.d_model,
                     num_heads=cfg.n_heads,
@@ -66,12 +75,14 @@ class BabyHatchlingModel(nn.Module):
                     spike_decay=cfg.spike_decay,
                     spike_threshold=cfg.spike_threshold,
                     spike_surrogate_beta=cfg.spike_surrogate_beta,
+                    token_drop_prob=layer_drop_prob,
                 )
                 self.kda_positions.append(idx)
             self.layers.append(block)
 
         self.use_memory = cfg.use_episodic_memory
         self.use_curiosity = cfg.use_curiosity_bonus
+        self.use_checkpoint = cfg.use_gradient_checkpointing
         self.pred_head = PredictiveCodingHead(
             cfg.d_model, cfg.vocab_size, self.embedding, enabled=cfg.use_predictive_head
         )
@@ -96,7 +107,10 @@ class BabyHatchlingModel(nn.Module):
                 hidden, updated_state = layer(hidden, layer_state)
                 new_states.append(updated_state)
             else:
-                hidden = layer(hidden)
+                if self.use_checkpoint and self.training:
+                    hidden = checkpoint(layer, hidden)
+                else:
+                    hidden = layer(hidden)
 
         if use_memory and self.use_memory:
             hidden = self._memory_read(hidden)

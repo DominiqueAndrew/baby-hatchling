@@ -47,11 +47,14 @@ class KDABlock(nn.Module):
         spike_decay: float = 0.9,
         spike_threshold: float = 0.5,
         spike_surrogate_beta: float = 10.0,
+        token_drop_prob: float = 0.0,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.dk = dk
         self.dv = dv
+        self.token_drop_prob = token_drop_prob
+        self.last_drop_fraction = 0.0
 
         self.norm_in = RMSNorm(d_model)
         self.short_conv = depthwise_short_conv(d_model)
@@ -116,13 +119,34 @@ class KDABlock(nn.Module):
         beta_base = self.beta_proj(h)  # [B,T,H]
 
         outputs = []
+        drop_mask = None
+        if self.training and self.token_drop_prob > 0.0:
+            drop_mask = torch.rand(bsz, seq, device=device) < self.token_drop_prob
+            guard = min(2, seq)
+            drop_mask[:, :guard] = False
+            drop_mask[:, -guard:] = False
+            self.last_drop_fraction = float(drop_mask.float().mean().item())
+        else:
+            self.last_drop_fraction = 0.0
+        prev_out = None
         for t in range(seq):
             spike_mem, spike = self.lif(spike_mem, spike_drive[:, t])
             alpha = torch.sigmoid(alpha_base[:, t] + self.alpha_spike * spike)
             beta = beta_base[:, t].unsqueeze(-1)
             beta = torch.sigmoid(beta + torch.sum(spike * self.beta_spike, dim=-1, keepdim=True))
             active = (spike.abs().sum(dim=-1, keepdim=True) > 0).to(x.dtype)
+            if drop_mask is not None:
+                token_keep = (~drop_mask[:, t]).to(x.dtype).unsqueeze(-1).unsqueeze(-1)
+                active = active * token_keep
             s, out = self._step(s, q[:, t], k[:, t], v[:, t], alpha, beta, active)
+            if drop_mask is not None:
+                if prev_out is None:
+                    prev_out = torch.zeros_like(out)
+                mask_t = drop_mask[:, t].to(out.dtype).unsqueeze(-1).unsqueeze(-1)
+                out = out * (1 - mask_t) + prev_out * mask_t
+                prev_out = out.detach()
+            else:
+                prev_out = out.detach()
             outputs.append(out)
         y = torch.stack(outputs, dim=1)  # [B,T,H,dv]
         y = self.head_norm(y).reshape(bsz, seq, -1)
