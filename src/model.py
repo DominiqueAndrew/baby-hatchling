@@ -36,6 +36,7 @@ class ModelConfig:
     use_episodic_memory: bool = True
     use_curiosity_bonus: bool = True
     use_gradient_checkpointing: bool = False
+    kda_chunk_size: int = 16
     token_drop: Optional[dict] = None
 
 
@@ -76,6 +77,7 @@ class BabyHatchlingModel(nn.Module):
                     spike_threshold=cfg.spike_threshold,
                     spike_surrogate_beta=cfg.spike_surrogate_beta,
                     token_drop_prob=layer_drop_prob,
+                    chunk_size=getattr(cfg, 'kda_chunk_size', 16),
                 )
                 self.kda_positions.append(idx)
             self.layers.append(block)

@@ -42,6 +42,10 @@ class GlobalNoPEBlock(nn.Module):
             self.gw_tokens = nn.Parameter(torch.zeros(gw_tokens, d_model))
         else:
             self.register_parameter("gw_tokens", None)
+        
+        # Cache for causal mask to avoid recreating every forward pass
+        self.register_buffer("_causal_mask_cache", None, persistent=False)
+        self._cached_mask_size = 0
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq, dim = x.shape
@@ -79,7 +83,13 @@ class GlobalNoPEBlock(nn.Module):
         v_flat = v.permute(0, 2, 1, 3).reshape(bsz * heads, t, self.dv)
 
         scores = torch.bmm(q_flat, k_flat.transpose(1, 2)) / math.sqrt(self.dk)
-        causal_mask = torch.tril(torch.ones(t, t, device=q.device, dtype=torch.bool))
+        
+        # Use cached causal mask to avoid recreating every forward pass
+        if self._causal_mask_cache is None or self._cached_mask_size < t:
+            self._causal_mask_cache = torch.tril(torch.ones(t, t, device=q.device, dtype=torch.bool))
+            self._cached_mask_size = t
+        causal_mask = self._causal_mask_cache[:t, :t]
+        
         scores = scores.masked_fill(~causal_mask, float("-inf"))
         weights = torch.softmax(scores, dim=-1)
         ctx = torch.bmm(weights, v_flat)
