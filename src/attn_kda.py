@@ -636,7 +636,7 @@ class KDABlock(nn.Module):
                     total_mem = None
                 if total_mem is not None and total_mem <= self.scan_memory_threshold_bytes:
                     lowmem_cap = True
-                    block = min(block, max(1, chunk_floor // 2))
+                    block = 1
                 free_mem = None
                 mem_getter = getattr(torch.cuda, "mem_get_info", None)
                 if mem_getter is not None:
@@ -647,7 +647,7 @@ class KDABlock(nn.Module):
                 if free_mem:
                     per_token = self._estimate_scan_token_bytes(batch, element_size)
                     if per_token > 0:
-                        frac = 0.1 if lowmem_cap else 0.2
+                        frac = 0.05 if lowmem_cap else 0.2
                         safe_bytes = max(1, int(free_mem * frac))
                         est = safe_bytes // per_token
                         if est > 0:
@@ -664,6 +664,7 @@ class KDABlock(nn.Module):
             return min(batch, max(1, self.scan_batch_block_override))
 
         block = batch
+        lowmem_cap = False
         if device.type == "cuda" and torch.cuda.is_available():
             try:
                 idx = device.index if device.index is not None else torch.cuda.current_device()
@@ -676,7 +677,10 @@ class KDABlock(nn.Module):
                 except (AssertionError, RuntimeError):
                     total_mem = None
                 if total_mem is not None and total_mem <= self.scan_memory_threshold_bytes:
-                    block = max(1, min(batch, batch // 4 or 1))
+                    lowmem_cap = True
+                    block = 1
+        if lowmem_cap and block > 1:
+            block = max(1, min(block, batch // 2 or 1))
         return block
 
     def _estimate_scan_token_bytes(self, batch: int, element_size: int) -> int:
