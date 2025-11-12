@@ -179,6 +179,6 @@ Use the tiny `hn_toddler` config to sanity-check new data or training changes wi
 bash scripts/run_toddler.sh configs/hn_toddler.yaml
 ```
 
-It trains an 8-layer, 256d model on a single Wikitext-2 shard (~1.5 K steps, `seq_len=256`), so it finishes in ~20 minutes on a 24 GB GPU while keeping the SQLite episodic store active (4 MiB cap). Tune `datasets.pretrain[0].limit` to match your quick-test corpus if needed.
+It trains an 8-layer, 256d model on a single Wikitext-2 shard (streaming loader, `seq_len=192`, 600 steps, no grad accumulation), so it typically finishes within ~20 minutes on a 24 GB GPU while keeping the SQLite episodic store active (4 MiB cap). Tune `datasets.pretrain[0].limit` or swap in your own shard for other quick viability checks.
 
 Everything needed to run the sequential training stages on your cloud GPU (crawler → pretrain → SFT → RLVR → eval) now ships in-tree with spiking gates, dynamic RL controls, curriculum-aware training, and scripts wired to the new Hatchling-NEURO configs.

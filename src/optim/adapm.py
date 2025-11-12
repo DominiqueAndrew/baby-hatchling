@@ -51,14 +51,15 @@ class AdaPM(Optimizer):
 
                 if grad.ndim >= 2:
                     rows = grad.size(0)
-                    if "row_momentum" not in state:
-                        state["row_momentum"] = torch.zeros(
-                            rows, 1, device=grad.device, dtype=grad.dtype
-                        )
-                    buf = state["row_momentum"]
-                    grad_mean = grad.mean(dim=1, keepdim=True)
+                    flat = grad.view(rows, -1)
+                    buf = state.get("row_momentum")
+                    if buf is None or buf.size(0) != rows:
+                        buf = torch.zeros(rows, 1, device=grad.device, dtype=grad.dtype)
+                        state["row_momentum"] = buf
+                    grad_mean = flat.mean(dim=1, keepdim=True)
                     buf.mul_(beta).add_(grad_mean, alpha=1 - beta)
-                    update = grad + gamma * buf
+                    row_bias = buf.view(rows, *([1] * (grad.ndim - 1)))
+                    update = grad + gamma * row_bias
                 else:
                     if "scalar_momentum" not in state:
                         state["scalar_momentum"] = torch.zeros_like(grad)

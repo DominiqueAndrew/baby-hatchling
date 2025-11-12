@@ -415,17 +415,20 @@ def train(args: argparse.Namespace) -> None:
             micro_step += 1
 
             if micro_step % grad_accum == 0:
+                optimizer_stepped = False
                 if use_amp:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    scaler.step(optimizer)
+                    step_result = scaler.step(optimizer)
+                    optimizer_stepped = step_result is not None
                     scaler.update()
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     optimizer.step()
+                    optimizer_stepped = True
                 # Scheduler should be called after optimizer.step() per PyTorch best practices
                 # Only call after we've actually done an optimizer step (not on step 0 before first update)
-                if scheduler is not None:
+                if scheduler is not None and optimizer_stepped:
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)  # More memory efficient
                 # Only clear cache every 100 steps to avoid slowdown from synchronous calls

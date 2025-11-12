@@ -19,24 +19,24 @@ model:
   use_predictive_head: false
   use_episodic_memory: true
   use_curiosity_bonus: false
-  use_gradient_checkpointing: true
+  use_gradient_checkpointing: false
   kda_chunk_size: 32
   kda_mode: scan
   kda_scan_min_len: 64
   token_drop:
     enabled: false
 train:
-  use_streaming_loader: false
+  use_streaming_loader: true
   pretrain:
-    seq_len: 256
-    batch_tokens: 2048
-    grad_accum: 2
+    seq_len: 192
+    batch_tokens: 1536
+    grad_accum: 1
     grad_clip: 1.0
-    max_steps: 1500
+    max_steps: 600
     lr_schedule:
       type: cosine
-      warmup_steps: 100
-      min_factor: 0.1
+      warmup_steps: 50
+      min_factor: 0.2
     early_stopping:
       enabled: false
     sparsity:
@@ -58,5 +58,5 @@ datasets:
       hf_id: Salesforce/wikitext
       config: wikitext-2-v1
       split: train
-      limit: 4000
+      limit: 2000
       field: text
