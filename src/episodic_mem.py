@@ -1,13 +1,17 @@
-"""Tiny episodic memory backed by SQLite + FAISS."""
+"""Tiny episodic memory backed by SQLite + FAISS (with CPU fallback)."""
 from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
 from typing import Optional, Tuple
 
-import faiss
 import numpy as np
 import torch
+
+try:  # pragma: no cover - optional dependency
+    import faiss  # type: ignore
+except ImportError:  # pragma: no cover - fallback path
+    faiss = None
 
 
 class EpisodicMemory:
@@ -32,7 +36,7 @@ class EpisodicMemory:
         self.max_entries = max(1, max_bytes // (dim * 4 * 2))
         self.keys = np.zeros((0, dim), dtype="float32")
         self.values = np.zeros((0, dim), dtype="float32")
-        self.index = faiss.IndexFlatL2(dim)
+        self.index = faiss.IndexFlatL2(dim) if faiss is not None else None
         self.last_gate = 0.0
 
     def should_write(self, entropy: float, error: float) -> bool:
@@ -63,11 +67,21 @@ class EpisodicMemory:
         if len(self.keys) == 0:
             return torch.zeros_like(key), 0.0
         key_np = key.detach().cpu().to(torch.float32).numpy().reshape(1, self.dim)
-        distances, indices = self.index.search(key_np, min(k, len(self.keys)))
-        weights = torch.softmax(torch.from_numpy(-distances[0]).float(), dim=0)
-        retrieved = torch.from_numpy(self.values[indices[0]]).float()
+        if self.index is not None:
+            distances, indices = self.index.search(key_np, min(k, len(self.keys)))
+            retrieved = torch.from_numpy(self.values[indices[0]]).float()
+            dists = torch.from_numpy(distances[0]).float()
+        else:  # CPU fallback
+            all_keys = torch.from_numpy(self.keys).float()
+            q = torch.from_numpy(key_np[0]).float().unsqueeze(0)
+            dists_full = torch.cdist(q, all_keys).squeeze(0)
+            k_eff = min(k, dists_full.numel())
+            dists, top_idx = torch.topk(-dists_full, k_eff)
+            dists = -dists
+            retrieved = torch.from_numpy(self.values[top_idx.cpu().numpy()]).float()
+        weights = torch.softmax(-dists, dim=0)
         combined = torch.sum(weights.unsqueeze(-1) * retrieved, dim=0).to(key.device)
-        gate = float(torch.clamp(weights.mean(), 0.0, 1.0).item())
+        gate = float(torch.clamp(weights.max(), 0.0, 1.0).item())
         return combined, gate
 
     def maybe_write(
@@ -95,6 +109,8 @@ class EpisodicMemory:
         return key
 
     def _rebuild_index(self) -> None:
+        if self.index is None:
+            return
         self.index.reset()
         if len(self.keys) > 0:
             self.index.add(self.keys)

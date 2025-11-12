@@ -162,6 +162,10 @@ pytest -q
 ```
 Coverage:
 - Spike-KDA streaming vs. full pass equivalence (`tests/test_kda.py`)
+- KDA stability / gradient flow over long sequences (`tests/test_kda_stability.py`)
+- Right-shifted label builder (`tests/test_labels.py`)
+- Predictive head + curiosity normalization (`tests/test_pc_head.py`)
+- Episodic memory k-NN gating and penalties (`tests/test_episode_knn.py`)
 - NoPE causality, episodic memory read/write gates, sandbox safety
 - PPO objective clipping + truncated IS
 - Local-shard loader (`tests/test_data_loader.py`) to ensure crawler output is ingestible
@@ -186,10 +190,29 @@ bash scripts/run_toddler_sft.sh configs/hn_toddler_sft.yaml
 bash scripts/run_toddler_rlvr.sh configs/hn_toddler_rlvr.yaml
 ```
 
-- Stage A trains an 8-layer, 256d model on a single Wikitext-2 shard (streaming loader, `seq_len=192`, 600 steps, no grad accumulation) and keeps the SQLite episodic store active (4 MiB cap).
-- Stage B runs ~600 supervised steps on 2 k instruction traces (Alpaca/OpenHermes).
-- Stage C runs ~200 micro-RLVR updates on GSM8K-mini + Humaneval-mini to exercise the reward plumbing.
+- Stage A trains an 8-layer, 256d model on a streaming Wikitext-2 shard (`seq_len=256`, `batch_tokens≈2k`, fixed 8 workers/prefetch 4) for 600 steps with the SQLite episodic store active (4 MiB cap).
+- Stage B runs ~600 supervised steps on ~11 k instruction traces (1 k Alpaca + 10 k sampled OpenHermes) with the same Toddler backbone.
+- Stage C runs ~200 micro-RLVR updates on GSM8K-mini + HumanEval/EvalPlus-mini with truncated importance sampling, ratio clipping, and a tiny PTX mix.
 - Pretrain/SFT toddler configs now auto-expand `batch_tokens` and dataloader workers whenever the GPU is <70 % utilized, so expect the first few steps to print `[auto-batch]` messages as they ramp to fill VRAM.
+
+### Quick smoke tests
+- **Overfit-one-batch (pretrain sanity):**
+  ```bash
+  python -m src.trainer \
+    --config configs/hn_toddler.yaml \
+    --stage pretrain \
+    --overfit_one_batch \
+    --save out/hn_toddler_overfit.pt
+  ```
+  Expect the loss to drop below 1.0 on the frozen batch within ~50 updates; if it does not, labels/gradients are miswired.
+- **Smoke RLVR:** after Stage B, run
+  ```bash
+  python -m src.policy_rlvr \
+    --config configs/hn_toddler_rlvr.yaml \
+    --load out/hn_toddler_sft.pt \
+    --save out/hn_toddler_rlvr_smoke.pt
+  ```
+  The CSV (`logs/rlvr.csv`) should show positive math/code reward trends and an adaptive KL coefficient hovering near 0.02.
 
 All three stages finish within roughly an hour on a 24 GB GPU, giving you an end-to-end but tiny checkpoint (`out/hn_toddler_rlvr.pt`) you can chat with or evaluate before scaling configs back up. Tune the dataset `limit` fields if you want even faster iterations.
 

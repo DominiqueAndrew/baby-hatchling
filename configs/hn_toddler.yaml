@@ -16,10 +16,10 @@ model:
   spike_threshold: 0.4
   spike_surrogate_beta: 8.0
   episodic_bytes: 4194304     # 4 MiB cap keeps writes cheap
-  use_predictive_head: false
+  use_predictive_head: true
   use_episodic_memory: true
-  use_curiosity_bonus: false
-  use_gradient_checkpointing: false
+  use_curiosity_bonus: true
+  use_gradient_checkpointing: true
   kda_chunk_size: 32
   kda_mode: scan
   kda_scan_min_len: 64
@@ -28,11 +28,13 @@ model:
 train:
   use_streaming_loader: true
   pretrain:
-    seq_len: 192
-    batch_tokens: 1536
+    seq_len: 256
+    batch_tokens: 2048
     grad_accum: 1
     grad_clip: 1.0
     max_steps: 600
+    num_workers: 8
+    prefetch_factor: 4
     dynamic_batch:
       enabled: true
       max_tokens: 4096
@@ -41,21 +43,21 @@ train:
       min_util: 0.2
     lr_schedule:
       type: cosine
-      warmup_steps: 50
-      min_factor: 0.2
+      warmup_steps: 200
+      min_factor: 0.1
     early_stopping:
       enabled: false
     sparsity:
       enabled: false
 optim:
   type: adapm
-  lr: 0.0004
+  lr: 0.001
   beta: 0.9
   gamma: 0.25
   eps: 1.0e-08
   weight_decay: 0.0
 loss:
-  lambda_pc: 0.0
+  lambda_pc: 0.05
   lambda_epi: 0.01
   lambda_kl: 0.0
 datasets:

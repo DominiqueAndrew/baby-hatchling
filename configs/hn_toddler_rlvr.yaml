@@ -16,10 +16,10 @@ model:
   spike_threshold: 0.4
   spike_surrogate_beta: 8.0
   episodic_bytes: 4194304
-  use_predictive_head: false
+  use_predictive_head: true
   use_episodic_memory: true
-  use_curiosity_bonus: false
-  use_gradient_checkpointing: false
+  use_curiosity_bonus: true
+  use_gradient_checkpointing: true
   kda_chunk_size: 32
   kda_mode: scan
   kda_scan_min_len: 64
@@ -28,11 +28,14 @@ model:
 rlvr:
   steps: 200
   epsilon_clip: 0.2
-  rho_max: 3.0
+  rho_max: 2.0
   samples_per_prompt: 2
   temperature: 0.8
   kl_target: 0.02
   max_grad_norm: 1.0
+  max_new_tokens: 128
+  ptx_weight: 0.05
+  ptx_batch: 2
 optim:
   type: adapm
   lr: 0.00025
@@ -41,7 +44,7 @@ optim:
   eps: 1.0e-08
   weight_decay: 0.0
 loss:
-  lambda_pc: 0.0
+  lambda_pc: 0.05
   lambda_epi: 0.01
   lambda_kl: 0.0
 datasets:
@@ -55,3 +58,12 @@ datasets:
       hf_id: evalplus/humanevalplus
       split: test
       limit: 64
+  sft_mix:
+    - name: alpaca_mix
+      hf_id: tatsu-lab/alpaca
+      split: train
+      limit: 2000
+      template: |
+        Instruction: {instruction}
+        Input: {input}
+        Response: {output}

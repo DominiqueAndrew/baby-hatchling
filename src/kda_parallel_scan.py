@@ -46,14 +46,10 @@ def precompute_updates(
         alpha_eff = torch.where(token_keep_alpha > 0, alpha_eff, torch.ones_like(alpha_eff))
         beta_eff = beta_eff * token_keep_beta
 
-    alpha_k = alpha_eff * k
     writes = torch.matmul(k.unsqueeze(-1), v.unsqueeze(-2))
     writes = beta_eff.unsqueeze(-1) * writes
 
-    decay_diag = torch.diag_embed(alpha_eff)
-    forget_rank1 = torch.matmul(k.unsqueeze(-1), alpha_k.unsqueeze(-2))
-    forget_rank1 = beta_eff.unsqueeze(-1) * forget_rank1
-    transitions = decay_diag - forget_rank1
+    transitions = torch.diag_embed(alpha_eff)
 
     return KDAParallelUpdates(transitions=transitions, writes=writes, drop_mask=drop_mask)
 

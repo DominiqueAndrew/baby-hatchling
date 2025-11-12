@@ -108,10 +108,15 @@ class KDABlock(nn.Module):
         self.beta_spike = nn.Parameter(torch.zeros(1, num_heads, dk))
 
         self.head_norm = HeadwiseRMSNorm(num_heads, dv)
+        self.q_norm = HeadwiseRMSNorm(num_heads, dk)
+        self.k_norm = HeadwiseRMSNorm(num_heads, dk)
+        self.v_norm = HeadwiseRMSNorm(num_heads, dv)
         self.low_rank_u1 = nn.Linear(d_model, rank_gate)
         self.low_rank_u2 = nn.Linear(rank_gate, d_model)
         self.ff_norm = RMSNorm(d_model)
         self.ff = SwiGLU(d_model, d_ff)
+        self.alpha_floor = 1e-4
+        self.beta_floor = 0.0
 
     def forward(
         self,
@@ -140,12 +145,9 @@ class KDABlock(nn.Module):
         conv = self.short_conv(h.transpose(1, 2)).transpose(1, 2)
         h = self.act(conv)
 
-        q = self._reshape_heads(self.q_proj(h), self.dk)  # [B,T,H,dk]
-        k = self._reshape_heads(self.k_proj(h), self.dk)
-        v = self._reshape_heads(self.v_proj(h), self.dv)
-
-        q = q / (q.norm(dim=-1, keepdim=True) + 1e-6)
-        k = k / (k.norm(dim=-1, keepdim=True) + 1e-6)
+        q = self.q_norm(self._reshape_heads(self.q_proj(h), self.dk))
+        k = self.k_norm(self._reshape_heads(self.k_proj(h), self.dk))
+        v = self.v_norm(self._reshape_heads(self.v_proj(h), self.dv))
 
         spike_drive = self._reshape_heads(self.spike_proj(h), self.dk)
         alpha_base = self._reshape_heads(self.alpha_down(torch.nn.functional.silu(self.alpha_up(h))), self.dk)
@@ -246,8 +248,10 @@ class KDABlock(nn.Module):
         for t in range(seq):
             spike_mem, spike = self.lif(spike_mem, spike_drive[:, t])
             alpha = torch.sigmoid(alpha_base[:, t] + self.alpha_spike * spike)
+            alpha = torch.clamp(alpha, self.alpha_floor, 1.0)
             beta = beta_base[:, t].unsqueeze(-1)
             beta = torch.sigmoid(beta + torch.sum(spike * self.beta_spike, dim=-1, keepdim=True))
+            beta = torch.clamp(beta, self.beta_floor, 1.0)
             active = (spike.abs().sum(dim=-1, keepdim=True) > 0).to(q.dtype)
             if drop_mask is not None:
                 token_keep = (~drop_mask[:, t]).to(q.dtype).unsqueeze(-1).unsqueeze(-1)
@@ -383,10 +387,12 @@ class KDABlock(nn.Module):
                         alpha_base[:, start : start + block_len]
                         + self.alpha_spike.unsqueeze(1) * spike_block
                     )
+                    alpha_block = torch.clamp(alpha_block, self.alpha_floor, 1.0)
                     beta_block = torch.sigmoid(
                         beta_base[:, start : start + block_len].unsqueeze(-1)
                         + torch.sum(spike_block * self.beta_spike.unsqueeze(1), dim=-1, keepdim=True)
                     )
+                    beta_block = torch.clamp(beta_block, self.beta_floor, 1.0)
                     active_block = (spike_block.abs().sum(dim=-1, keepdim=True) > 0).to(q.dtype)
                     updates: KDAParallelUpdates = precompute_updates(
                         k[:, start : start + block_len],
@@ -440,7 +446,11 @@ class KDABlock(nn.Module):
     def _compute_spike_block(
         self, spike_mem: torch.Tensor, drive_block: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute spikes for a block without materializing the whole sequence."""
+        """Compute spikes for a block without materializing the whole sequence.
+        
+        Note: This loop is sequential due to LIF dynamics but will be optimized
+        by torch.compile when the model is compiled.
+        """
 
         bsz, block_len, _, _ = drive_block.shape
         spikes = torch.empty(
@@ -452,6 +462,7 @@ class KDABlock(nn.Module):
             dtype=drive_block.dtype,
         )
         current = spike_mem
+        # Sequential loop required for LIF dynamics - compilation will optimize
         for idx in range(block_len):
             current, spike = self.lif(current, drive_block[:, idx])
             spikes[:, idx] = spike
@@ -469,21 +480,7 @@ class KDABlock(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs a single recurrent step (vectorized over batch+heads)."""
 
-        if active is not None:
-            alpha = torch.where(active.expand_as(alpha) > 0, alpha, torch.ones_like(alpha))
-            beta = beta * active
-        # Apply channel-wise decay
-        s = s * alpha.unsqueeze(-1)
-        # Rank-1 forget via k^T S term
-        u = torch.einsum("bhd,bhdv->bhv", k, s)
-        forget = torch.einsum("bhd,bhv->bhdv", k, u)
-        s = s - beta.unsqueeze(-1) * forget
-        # Delta rule write
-        write = torch.einsum("bhd,bhv->bhdv", k, v)
-        s = s + beta.unsqueeze(-1) * write
-        # Output
-        out = torch.einsum("bhdv,bhd->bhv", s, q)
-        return s, out
+        return self._step_optimized(s, q, k, v, alpha, beta, active)
     
     def _step_optimized(
         self,
@@ -495,38 +492,21 @@ class KDABlock(nn.Module):
         beta: torch.Tensor,
         active: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Optimized version of _step using bmm instead of einsum for speed."""
-        bsz, heads, dk = k.shape
-        dv = v.shape[-1]
-        
+        """Numerically stable fast-weight update."""
+
+        decay = torch.clamp(alpha, self.alpha_floor, 1.0)
+        write_gate = torch.clamp(beta, self.beta_floor, 1.0)
         if active is not None:
-            alpha = torch.where(active.expand_as(alpha) > 0, alpha, torch.ones_like(alpha))
-            beta = beta * active
-        
-        # Apply channel-wise decay (fused)
-        s = s * alpha.unsqueeze(-1)
-        
-        # Compute forget using broadcasting (faster than einsum)
-        # u = k^T @ s: contract over dk
-        k_expanded = k.unsqueeze(-1)  # [B, H, dk, 1]
-        s_for_u = s.transpose(-2, -1)  # [B, H, dv, dk]
-        u = (k_expanded * s_for_u.transpose(-2, -1)).sum(dim=-2)  # [B, H, dv]
-        
-        # forget = k ⊗ u (outer product via broadcasting)
-        forget = k.unsqueeze(-1) * u.unsqueeze(-2)  # [B, H, dk, dv]
-        
-        # write = k ⊗ v (outer product via broadcasting)
-        write = k.unsqueeze(-1) * v.unsqueeze(-2)  # [B, H, dk, dv]
-        
-        # Update state (fused operations)
-        beta_expanded = beta.unsqueeze(-1)
-        s = s - beta_expanded * forget + beta_expanded * write
-        
-        # Output: q^T @ s (contract over dk)
-        q_expanded = q.unsqueeze(-2)  # [B, H, 1, dk]
-        out = (q_expanded * s).sum(dim=-2)  # [B, H, dv]
-        
+            decay = torch.where(active.expand_as(decay) > 0, decay, torch.ones_like(decay))
+            write_gate = write_gate * active
+
+        s = s * decay.unsqueeze(-1)
+        s = s + write_gate.unsqueeze(-1) * self._kv_outer(k, v)
+        out = torch.einsum("bhdv,bhd->bhv", s, q)
         return s, out
+
+    def _kv_outer(self, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return torch.matmul(k.unsqueeze(-1), v.unsqueeze(-2))
 
     def _reshape_heads(self, proj: torch.Tensor, width: int) -> torch.Tensor:
         bsz, seq, _ = proj.shape

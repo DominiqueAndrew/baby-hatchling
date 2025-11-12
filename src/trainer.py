@@ -5,6 +5,7 @@ import argparse
 import math
 import os
 import random
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence
@@ -13,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 from tqdm import tqdm
 
@@ -21,6 +23,7 @@ from .optim import AdaPM
 from .tokenizer import SentencePieceTokenizer
 from .utils.config import load_config
 from .utils.data import contamination_report, load_text_splits, stream_dataset_texts
+from .utils.loss import make_next_token_labels
 from .utils.logging import CSVLogger
 from .utils.sparsity import MSTSparsifier, SparsitySchedule, collect_sparse_modules
 
@@ -29,6 +32,64 @@ from .utils.sparsity import MSTSparsifier, SparsitySchedule, collect_sparse_modu
 class Batch:
     tokens: torch.Tensor  # [B,T]
     targets: torch.Tensor  # [B,T]
+
+
+class CudaPrefetcher:
+    """Prefetches batches to GPU on a separate CUDA stream for overlapping H2D transfers."""
+    
+    def __init__(self, loader: DataLoader, device: torch.device):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream() if device.type == "cuda" else None
+        self.preload = None
+        self.preload_iter = None
+    
+    def __iter__(self):
+        self.preload_iter = iter(self.loader)
+        if self.stream is not None:
+            # Preload first batch on CUDA stream
+            try:
+                with torch.cuda.stream(self.stream):
+                    batch = next(self.preload_iter)
+                    self.preload = Batch(
+                        tokens=batch.tokens.to(self.device, non_blocking=True),
+                        targets=batch.targets.to(self.device, non_blocking=True),
+                    )
+            except StopIteration:
+                self.preload = None
+        else:
+            # CPU case: just yield batches directly (no prefetching benefit)
+            for batch in self.preload_iter:
+                yield Batch(
+                    tokens=batch.tokens.to(self.device),
+                    targets=batch.targets.to(self.device),
+                )
+            return
+        
+        while True:
+            if self.preload is None:
+                break
+            
+            # Swap current and preload
+            current = self.preload
+            self.preload = None
+            
+            if self.stream is not None:
+                # Wait for current batch to be ready
+                torch.cuda.current_stream().wait_stream(self.stream)
+                
+                # Preload next batch in background
+                try:
+                    with torch.cuda.stream(self.stream):
+                        batch = next(self.preload_iter)
+                        self.preload = Batch(
+                            tokens=batch.tokens.to(self.device, non_blocking=True),
+                            targets=batch.targets.to(self.device, non_blocking=True),
+                        )
+                except StopIteration:
+                    pass
+            
+            yield current
 
 
 class ChunkedDataset(Dataset):
@@ -91,6 +152,50 @@ class StreamingChunkedDataset(IterableDataset):
                         token_buffer = token_buffer[self.seq_len :]
                         seq = torch.tensor(window, dtype=torch.long)
                         yield Batch(tokens=seq[:-1], targets=seq[1:])
+
+
+def parameter_checksum(model: nn.Module, sample_size: int = 2048) -> float:
+    remaining = sample_size
+    checksum = 0.0
+    for param in model.parameters():
+        if not param.requires_grad or remaining <= 0:
+            continue
+        flat = param.detach().view(-1)
+        if flat.numel() == 0:
+            continue
+        take = min(remaining, flat.numel())
+        checksum += float(flat[:take].abs().sum().item())
+        remaining -= take
+    return checksum
+
+
+def grad_flow_summary(model: nn.Module) -> tuple[float, float, dict]:
+    total = 0
+    active = 0
+    global_sq = 0.0
+    per_block: dict[str, float] = defaultdict(float)
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        total += 1
+        if param.grad is None:
+            continue
+        active += 1
+        grad = param.grad.detach()
+        global_sq += float(torch.sum(grad * grad).item())
+        block = name.split(".", 1)[0]
+        per_block[block] += float(grad.norm().item())
+    percent = 100.0 * active / max(1, total)
+    global_norm = math.sqrt(max(global_sq, 0.0))
+    return percent, global_norm, dict(per_block)
+
+
+def assert_training_mode(model: nn.Module) -> None:
+    if not model.training:
+        raise RuntimeError("Model left training mode; ensure model.train() is active.")
+    for name, module in model.named_modules():
+        if hasattr(module, "training") and not module.training:
+            raise RuntimeError(f"Submodule '{name}' switched to eval() during training.")
 
 
 def collate_fn(batch: Sequence[Batch]) -> Batch:
@@ -211,6 +316,96 @@ def auto_workers(use_gpu: bool, seq_len: int = 1024, device: torch.device | None
     return num_workers, prefetch
 
 
+def find_max_batch_tokens(
+    model: nn.Module,
+    seq_len: int,
+    device: torch.device,
+    start: int = 4096,
+    step: int = 2048,
+    floor: int = 2048,
+    max_tokens: int = 16384,
+) -> int:
+    """Find maximum safe batch_tokens via binary search with OOM detection.
+    
+    Parameters
+    ----------
+    model: Model to test with
+    seq_len: Sequence length to use
+    device: GPU device
+    start: Starting batch_tokens to test
+    step: Initial step size for binary search
+    floor: Minimum step size before stopping
+    max_tokens: Maximum batch_tokens to test
+    
+    Returns
+    -------
+    Maximum safe batch_tokens that doesn't cause OOM
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return start
+    
+    was_training = model.training
+    model.eval()
+    batch_size = max(1, start // seq_len)
+    ok = start
+    current = start
+    
+    print(f"[batch-finder] Starting search for max batch_tokens (seq_len={seq_len})...")
+    
+    with torch.no_grad():
+        while True:
+            try:
+                # Clear cache before test
+                torch.cuda.empty_cache()
+                
+                # Create dummy batch
+                tokens = torch.randint(0, 1000, (batch_size, seq_len), device=device)
+                
+                # Try forward pass
+                with autocast():
+                    _ = model(tokens)
+                
+                # Success - try larger
+                ok = current
+                if current >= max_tokens:
+                    break
+                if step <= floor:
+                    current = min(current + step, max_tokens)
+                    if current == ok:
+                        break
+                else:
+                    current = min(current + step, max_tokens)
+                    if current == ok:
+                        step = max(floor, step // 2)
+                        if step <= floor:
+                            break
+                
+                batch_size = max(1, current // seq_len)
+                
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if step <= floor:
+                    break
+                step = max(floor, step // 2)
+                current = ok + step if current != ok + step else ok
+                if current == ok:
+                    break
+                batch_size = max(1, current // seq_len)
+            except Exception as e:
+                # Non-OOM error - be conservative
+                print(f"[batch-finder] Error during test: {e}")
+                break
+    
+    torch.cuda.empty_cache()
+    if was_training:
+        model.train()
+    
+    # Align to seq_len
+    aligned = max(seq_len, (ok // seq_len) * seq_len)
+    print(f"[batch-finder] Found max safe batch_tokens: {aligned}")
+    return aligned
+
+
 def maybe_scale_batch_tokens(
     batch_tokens: int, seq_len: int, device: torch.device | None, cfg: dict | None
 ) -> int:
@@ -254,16 +449,19 @@ def build_stage_loader(
     batch_size = max(1, batch_tokens // seq_len)
     if streaming:
         dataset = StreamingChunkedDataset(data_source, tokenizer, seq_len, seed=seed)
-        num_workers = 0
-        prefetch = None
-        dataloader = DataLoader(
-            dataset,
+        num_workers = stage_cfg.get("num_workers", 8 if use_gpu else 0)
+        prefetch = stage_cfg.get("prefetch_factor", 4 if num_workers > 0 else None)
+        loader_kwargs = dict(
+            dataset=dataset,
             batch_size=batch_size,
             collate_fn=collate_fn,
-            num_workers=0,
+            num_workers=num_workers,
             pin_memory=use_gpu,
-            persistent_workers=False,
+            persistent_workers=num_workers > 0,
         )
+        if num_workers > 0 and prefetch:
+            loader_kwargs["prefetch_factor"] = prefetch
+        dataloader = DataLoader(**loader_kwargs)
     else:
         dataset = ChunkedDataset(data_source, tokenizer, seq_len)
         num_workers, prefetch = auto_workers(use_gpu, seq_len, device if use_gpu else None)
@@ -326,6 +524,7 @@ def train(args: argparse.Namespace) -> None:
         raise KeyError(f"No training config found for stage '{args.stage}'.")
     optim_cfg = cfg["optim"]
     loss_cfg = cfg["loss"]
+    torch.set_float32_matmul_precision("high")
 
     if args.stage == "gridworld":
         try:
@@ -340,6 +539,9 @@ def train(args: argparse.Namespace) -> None:
         return
 
     set_seed(cfg.get("seed", 0))
+    # Set environment variables to avoid thread oversubscription with dataloader workers
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
     use_gpu = torch.cuda.is_available()
     num_cpu_threads = cfg.get("threads") or max(1, (os.cpu_count() or 4) - 2)
     torch.set_num_threads(num_cpu_threads)
@@ -348,6 +550,9 @@ def train(args: argparse.Namespace) -> None:
         print(f"PyTorch CPU threads: {num_cpu_threads}")
 
     tokenizer = SentencePieceTokenizer()
+    pad_token_id = tokenizer.pad_id
+    if tokenizer.eos_id == pad_token_id:
+        raise ValueError("Tokenizer PAD and EOS IDs must differ for stable training.")
     dataset_specs = cfg.get("datasets", {}).get(args.stage, [])
     streaming_loader = train_block.get("use_streaming_loader", False)
     if streaming_loader:
@@ -360,22 +565,79 @@ def train(args: argparse.Namespace) -> None:
     model = build_model(cfg["model"])
     device = torch.device("cuda" if use_gpu else "cpu")
     model.to(device)
+    if model.embedding.num_embeddings != tokenizer.vocab_size:
+        raise ValueError(
+            f"Tokenizer vocab ({tokenizer.vocab_size}) != model embeddings ({model.embedding.num_embeddings})"
+        )
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if trainable_params == 0:
+        raise RuntimeError("No trainable parameters were found.")
+    print(f"Trainable parameters: {trainable_params / 1e6:.2f}M")
+    checksum_steps = {0, 10}
+    logged_checksums: dict[int, bool] = {}
+
+    def maybe_log_checksum(step_idx: int) -> None:
+        if step_idx in checksum_steps and step_idx not in logged_checksums:
+            print(f"[param] step={step_idx} checksum={parameter_checksum(model):.4e}")
+            logged_checksums[step_idx] = True
+
+    maybe_log_checksum(0)
 
     if use_gpu:
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
         print(f"CUDA Version: {torch.version.cuda}")
+        
+        # Enable TF32 for Ampere+ GPUs (faster matmuls)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("TF32 enabled for matmuls and cuDNN")
 
     if args.load and Path(args.load).exists():
         state = torch.load(args.load, map_location="cpu")
         model.load_state_dict(state, strict=False)
+    
+    # Compile model for faster execution (after loading weights)
+    if use_gpu:
+        try:
+            model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+            print("Model compiled with torch.compile() for optimization")
+        except Exception as e:
+            print(f"torch.compile() not available or failed: {e}")
+            print("Continuing without compilation")
 
     optimizer = build_optimizer(model, optim_cfg)
 
     grad_clip = stage_cfg.get("grad_clip", 1.0)
     max_steps = stage_cfg.get("max_steps", 1000)
     curriculum = build_curriculum(stage_cfg, max_steps)
+    
+    # Find max safe batch_tokens for first stage if GPU available
+    if use_gpu and curriculum:
+        first_seq_len = curriculum[0]["seq_len"]
+        first_batch_tokens = curriculum[0]["batch_tokens"]
+        dynamic_cfg = stage_cfg.get("dynamic_batch", {})
+        max_tokens_cap = dynamic_cfg.get("max_tokens", 16384)
+        
+        try:
+            found_max = find_max_batch_tokens(
+                model, first_seq_len, device,
+                start=first_batch_tokens,
+                max_tokens=max_tokens_cap
+            )
+            # Update first stage and use as reference for others
+            curriculum[0]["batch_tokens"] = found_max
+            # Update max_tokens in dynamic_batch config if it's lower
+            if found_max < max_tokens_cap:
+                dynamic_cfg["max_tokens"] = found_max
+                print(f"[batch-finder] Updated dynamic_batch.max_tokens to {found_max}")
+        except Exception as e:
+            print(f"[batch-finder] Failed to find max batch_tokens: {e}")
+            print(f"[batch-finder] Using config value {first_batch_tokens} instead")
 
-    logger = CSVLogger(Path("logs") / f"train_{args.stage}.csv", ["step", "loss", "lm", "pc", "epi", "bonus"])
+    logger = CSVLogger(
+        Path("logs") / f"train_{args.stage}.csv",
+        ["step", "loss", "lm", "pc", "epi", "bonus", "lr", "grad_pct", "grad_norm"],
+    )
     scheduler = build_scheduler(optimizer, stage_cfg.get("lr_schedule", {}), max_steps)
 
     sparsifier = None
@@ -394,7 +656,7 @@ def train(args: argparse.Namespace) -> None:
             sparsifier.apply_masks()
 
     use_amp = use_gpu
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = GradScaler(enabled=use_amp)
     if use_amp:
         print("Using mixed precision training (FP16)")
 
@@ -416,8 +678,16 @@ def train(args: argparse.Namespace) -> None:
         streaming=streaming_loader,
         seed=seed,
     )
+    
+    # Optionally wrap with CUDA prefetcher for overlapping H2D transfers
+    use_prefetcher = use_gpu and stage_cfg.get("use_cuda_prefetcher", False)
+    if use_prefetcher:
+        dataloader = CudaPrefetcher(dataloader, device)
+        print("Using CUDA prefetcher for overlapping data transfers")
+    
     dataloader_iter = iter(dataloader)
     stage_step = 0
+    frozen_batch: Batch | None = None
 
     if use_gpu:
         effective_tokens = batch_size * seq_len
@@ -443,55 +713,63 @@ def train(args: argparse.Namespace) -> None:
             except StopIteration:
                 dataloader_iter = iter(dataloader)
                 batch = next(dataloader_iter)
+            if args.overfit_one_batch:
+                if frozen_batch is None:
+                    frozen_batch = batch
+                else:
+                    batch = frozen_batch
 
-            tokens = batch.tokens.to(device, non_blocking=use_gpu)
-            targets = batch.targets.to(device, non_blocking=use_gpu)
+            # If using prefetcher, batches are already on GPU
+            if use_prefetcher:
+                tokens = batch.tokens
+            else:
+                tokens = batch.tokens.to(device, non_blocking=use_gpu)
+            labels = make_next_token_labels(tokens, pad_token_id)
+            assert_training_mode(model)
 
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with autocast(enabled=use_amp):
                 pred_out, _ = model(tokens)
 
-            logits = pred_out.logits[:, :-1, :]
-            lm_loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), targets[:, : logits.size(1)].reshape(-1), ignore_index=0
-            )
+            logits = pred_out.logits
+            lm_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1), ignore_index=-100)
             lambda_pc = loss_cfg["lambda_pc"] if getattr(model.pred_head, "enabled", True) else 0.0
             total_loss = lm_loss + lambda_pc * pred_out.pc_loss
             epi_penalty = torch.tensor(model.episodic_gate_penalty(), device=device)
             total_loss = total_loss + loss_cfg.get("lambda_epi", 0.0) * epi_penalty
+            bonus = 0.0
+            if model.use_curiosity and getattr(model.pred_head, "enabled", True):
+                bonus = model.pred_head.curiosity_bonus(pred_out.error_trace)
             
+            loss = total_loss / grad_accum
             if use_amp:
-                scaler.scale(total_loss / grad_accum).backward()
+                scaler.scale(loss).backward()
             else:
-                (total_loss / grad_accum).backward()
+                loss.backward()
             micro_step += 1
 
             if micro_step % grad_accum == 0:
-                optimizer_stepped = False
                 if use_amp:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                    step_result = scaler.step(optimizer)
-                    optimizer_stepped = step_result is not None
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                if use_amp:
+                    scaler.step(optimizer)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                     optimizer.step()
-                    optimizer_stepped = True
-                # Scheduler should be called after optimizer.step() per PyTorch best practices
-                # Only call after we've actually done an optimizer step (not on step 0 before first update)
-                if scheduler is not None and optimizer_stepped:
+                if scheduler is not None:
                     scheduler.step()
-                optimizer.zero_grad(set_to_none=True)  # More memory efficient
+                optimizer.zero_grad(set_to_none=True)
                 # Only clear cache every 100 steps to avoid slowdown from synchronous calls
                 if use_gpu and step % 100 == 0:
                     torch.cuda.empty_cache()
 
-                # Log and compute metrics (these require .item() which is synchronous, so do it infrequently)
-                # But keep the tensors for now to avoid sync on every step
-                
-                # Save logs every 10 steps
+                current_lr = optimizer.param_groups[0]["lr"]
+                if step % 20 == 0:
+                    print(f"[lr] step={step} lr={current_lr:.3e}")
+                if use_amp and step % 20 == 0:
+                    print(f"[amp] step={step} scale={scaler.get_scale():.2e}")
                 if step % 10 == 0:
-                    bonus = model.pred_head.curiosity_bonus(pred_out.error_trace)
+                    grad_pct, grad_norm, block_norms = grad_flow_summary(model)
                     logger.log(
                         {
                             "step": step,
@@ -499,9 +777,20 @@ def train(args: argparse.Namespace) -> None:
                             "lm": float(lm_loss.item()),
                             "pc": float(pred_out.pc_loss.item()),
                             "epi": float(epi_penalty.item()),
-                            "bonus": bonus,
+                            "bonus": float(bonus),
+                            "lr": float(current_lr),
+                            "grad_pct": float(grad_pct),
+                            "grad_norm": float(grad_norm),
                         }
                     )
+                    if step % 50 == 0 and block_norms:
+                        top = ", ".join(f"{name}:{val:.2e}" for name, val in list(block_norms.items())[:3])
+                        print(f"[grad] step={step} active={grad_pct:.1f}% norm={grad_norm:.2e} {top}")
+                if step % 100 == 0 and getattr(model.pred_head, "enabled", True):
+                    mean = float(model.pred_head.ema_bonus_mean.item())
+                    std = float(model.pred_head.ema_bonus_var.sqrt().item())
+                    print(f"[bonus] step={step} mean={mean:.3e} std={std:.3e}")
+
                 # Save checkpoint every 1000 steps instead of every step to avoid massive slowdown
                 if args.save and (step % 1000 == 0 or step == max_steps - 1):
                     save_path = Path(args.save)
@@ -511,6 +800,7 @@ def train(args: argparse.Namespace) -> None:
                         print(f"\n💾 Checkpoint saved to {save_path}")
 
                 step += 1
+                maybe_log_checksum(step)
                 if sparsifier is not None:
                     sparsifier.maybe_update(step)
                 stage_step += 1
@@ -548,6 +838,9 @@ def train(args: argparse.Namespace) -> None:
                         streaming=streaming_loader,
                         seed=seed,
                     )
+                    # Re-wrap with prefetcher if enabled
+                    if use_prefetcher:
+                        dataloader = CudaPrefetcher(dataloader, device)
                     dataloader_iter = iter(dataloader)
                     stage_step = 0
                     micro_step = 0
@@ -591,6 +884,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--stage", choices=["pretrain", "sft", "gridworld"], default="pretrain")
     parser.add_argument("--load", default=None)
     parser.add_argument("--save", default="out/latest.pt")
+    parser.add_argument(
+        "--overfit_one_batch",
+        action="store_true",
+        help="Repeat the first batch every step (sanity check for labels/grad paths).",
+    )
     return parser
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import json
+import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, List, Mapping, Sequence
@@ -25,6 +26,36 @@ def _render_template(template: str, example: Mapping[str, object]) -> str:
 
     safe_map = DefaultDict({k: example.get(k, "") for k in example})
     return template.format_map(safe_map)
+
+
+def _example_to_text(spec: Mapping[str, object], example: Mapping[str, object], text_field: str) -> str:
+    template = spec.get("template")
+    if template:
+        return _render_template(template, example)
+    text = example.get(spec.get("field", text_field)) or example.get("content") or ""
+    if text:
+        return text
+    conversations = example.get("conversations")
+    if isinstance(conversations, list):
+        turns: List[str] = []
+        for turn in conversations:
+            content = turn.get("content") or turn.get("value") or ""
+            if not content:
+                continue
+            role = turn.get("role") or turn.get("from") or "user"
+            turns.append(f"{role}: {content}")
+        return "\n".join(turns)
+    messages = example.get("messages")
+    if isinstance(messages, list):
+        turns = []
+        for turn in messages:
+            content = turn.get("content") or ""
+            if not content:
+                continue
+            role = turn.get("role") or turn.get("author") or "user"
+            turns.append(f"{role}: {content}")
+        return "\n".join(turns)
+    return text
 
 
 def _load_local_samples(path_pattern: str, name: str | None = None) -> List[Sample]:
@@ -96,14 +127,14 @@ def load_text_splits(specs: Sequence[dict], text_field: str = "text") -> List[Sa
             
             samples = []
             for example in iterable:
-                template = spec.get("template")
-                if template:
-                    text = _render_template(template, example)
-                else:
-                    text = example.get(spec.get("field", text_field)) or example.get("content") or ""
-                if text:  # Only add non-empty texts
+                text = _example_to_text(spec, example, text_field)
+                if text:
                     samples.append(Sample(text=text, source=dataset_name))
-            
+            sample_count = spec.get("sample") or spec.get("take")
+            if sample_count and len(samples) > sample_count:
+                rng = random.Random(spec.get("seed", 0))
+                indices = rng.sample(range(len(samples)), sample_count)
+                samples = [samples[idx] for idx in indices]
             print(f"Loaded {len(samples)} samples from {dataset_name}")
             return samples
         except Exception as e:
@@ -162,11 +193,7 @@ def stream_dataset_texts(spec: Mapping[str, object], text_field: str = "text") -
     limit = spec.get("limit")
     count = 0
     for example in dataset:
-        template = spec.get("template")
-        if template:
-            text = _render_template(template, example)
-        else:
-            text = example.get(spec.get("field", text_field)) or example.get("content") or ""
+        text = _example_to_text(spec, example, text_field)
         if text:
             yield text
             count += 1

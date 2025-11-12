@@ -54,3 +54,12 @@ class SentencePieceTokenizer:
 
     def decode(self, ids: List[int]) -> str:
         return self.processor.decode(ids)
+
+    @property
+    def pad_id(self) -> int:
+        pad = self.processor.pad_id()
+        return pad if pad is not None and pad >= 0 else 0
+
+    @property
+    def vocab_size(self) -> int:
+        return int(self.processor.vocab_size())
