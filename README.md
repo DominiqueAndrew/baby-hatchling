@@ -189,6 +189,7 @@ bash scripts/run_toddler_rlvr.sh configs/hn_toddler_rlvr.yaml
 - Stage A trains an 8-layer, 256d model on a single Wikitext-2 shard (streaming loader, `seq_len=192`, 600 steps, no grad accumulation) and keeps the SQLite episodic store active (4 MiB cap).
 - Stage B runs ~600 supervised steps on 2 k instruction traces (Alpaca/OpenHermes).
 - Stage C runs ~200 micro-RLVR updates on GSM8K-mini + Humaneval-mini to exercise the reward plumbing.
+- Pretrain/SFT toddler configs now auto-expand `batch_tokens` and dataloader workers whenever the GPU is <70 % utilized, so expect the first few steps to print `[auto-batch]` messages as they ramp to fill VRAM.
 
 All three stages finish within roughly an hour on a 24 GB GPU, giving you an end-to-end but tiny checkpoint (`out/hn_toddler_rlvr.pt`) you can chat with or evaluate before scaling configs back up. Tune the dataset `limit` fields if you want even faster iterations.
 

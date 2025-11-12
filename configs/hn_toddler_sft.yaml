@@ -33,6 +33,11 @@ train:
     grad_accum: 1
     grad_clip: 1.0
     max_steps: 600
+    dynamic_batch:
+      enabled: true
+      max_tokens: 6144
+      max_factor: 3.0
+      target_util: 0.75
     lr_schedule:
       type: cosine
       warmup_steps: 50

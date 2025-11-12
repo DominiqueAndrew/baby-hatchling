@@ -172,7 +172,19 @@ def build_curriculum(train_cfg: dict, max_steps: int) -> List[dict]:
     return trimmed
 
 
-def auto_workers(use_gpu: bool, seq_len: int = 1024) -> tuple[int, int | None]:
+def _gpu_mem_util(device: torch.device | None) -> tuple[float, float] | tuple[None, None]:
+    if device is None or device.type != "cuda" or not torch.cuda.is_available():
+        return None, None
+    try:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        free_mem, total_mem = torch.cuda.mem_get_info(idx)
+        util = 1 - (free_mem / max(1, total_mem))
+        return util, total_mem
+    except (RuntimeError, AssertionError):
+        return None, None
+
+
+def auto_workers(use_gpu: bool, seq_len: int = 1024, device: torch.device | None = None) -> tuple[int, int | None]:
     if not use_gpu:
         return 0, None
     cpu_count = os.cpu_count() or 4
@@ -187,7 +199,43 @@ def auto_workers(use_gpu: bool, seq_len: int = 1024) -> tuple[int, int | None]:
     else:
         num_workers = min(12, max(4, cpu_count // 2))
         prefetch = 4
+    util_info = _gpu_mem_util(device)
+    if util_info[0] is not None:
+        util = util_info[0]
+        if util < 0.3:
+            num_workers = min(cpu_count, max(num_workers * 2, 2))
+            prefetch = (prefetch or 2) * 2
+        elif util > 0.85:
+            num_workers = max(1, num_workers // 2)
+            prefetch = max(2, (prefetch or 2) // 2)
     return num_workers, prefetch
+
+
+def maybe_scale_batch_tokens(
+    batch_tokens: int, seq_len: int, device: torch.device | None, cfg: dict | None
+) -> int:
+    if cfg is None or not cfg.get("enabled"):
+        return batch_tokens
+    util_info = _gpu_mem_util(device)
+    if util_info[0] is None:
+        return batch_tokens
+    util = util_info[0]
+    target = cfg.get("target_util", 0.7)
+    floor = cfg.get("min_util", 0.15)
+    max_factor = cfg.get("max_factor", 2.0)
+    max_tokens = cfg.get("max_tokens", batch_tokens)
+    if util >= target:
+        return batch_tokens
+    scale = min(max_factor, target / max(util, floor))
+    new_tokens = min(int(batch_tokens * scale), max_tokens)
+    if new_tokens <= batch_tokens:
+        return batch_tokens
+    aligned = max(seq_len, (new_tokens // seq_len) * seq_len)
+    print(
+        f"[auto-batch] GPU util {util:.1%} < target {target:.0%}. "
+        f"Increasing batch_tokens {batch_tokens} -> {aligned}"
+    )
+    return aligned
 
 
 def build_stage_loader(
@@ -195,12 +243,14 @@ def build_stage_loader(
     tokenizer: SentencePieceTokenizer,
     stage_cfg: dict,
     use_gpu: bool,
+    device: torch.device,
     *,
     streaming: bool,
     seed: int,
-) -> tuple[DataLoader, int, int, int, int, int | None]:
+) -> tuple[DataLoader, int, int, int, int, int | None, int]:
     seq_len = stage_cfg["seq_len"]
     batch_tokens = stage_cfg["batch_tokens"]
+    batch_tokens = maybe_scale_batch_tokens(batch_tokens, seq_len, device if use_gpu else None, stage_cfg.get("dynamic_batch"))
     batch_size = max(1, batch_tokens // seq_len)
     if streaming:
         dataset = StreamingChunkedDataset(data_source, tokenizer, seq_len, seed=seed)
@@ -216,7 +266,7 @@ def build_stage_loader(
         )
     else:
         dataset = ChunkedDataset(data_source, tokenizer, seq_len)
-        num_workers, prefetch = auto_workers(use_gpu, seq_len)
+        num_workers, prefetch = auto_workers(use_gpu, seq_len, device if use_gpu else None)
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
@@ -229,7 +279,7 @@ def build_stage_loader(
             timeout=60,
         )
     grad_accum = stage_cfg.get("grad_accum", 1)
-    return dataloader, batch_size, grad_accum, seq_len, num_workers, prefetch
+    return dataloader, batch_size, grad_accum, seq_len, num_workers, prefetch, batch_tokens
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, lr_cfg: dict, total_steps: int):
@@ -357,11 +407,12 @@ def train(args: argparse.Namespace) -> None:
 
     stage_index = 0
     seed = cfg.get("seed", 0)
-    dataloader, batch_size, grad_accum, seq_len, workers, prefetch = build_stage_loader(
+    dataloader, batch_size, grad_accum, seq_len, workers, prefetch, stage_batch_tokens = build_stage_loader(
         data_source,
         tokenizer,
         curriculum[stage_index],
         use_gpu,
+        device,
         streaming=streaming_loader,
         seed=seed,
     )
@@ -371,7 +422,7 @@ def train(args: argparse.Namespace) -> None:
     if use_gpu:
         effective_tokens = batch_size * seq_len
         print(
-            f"Stage 0 ⇒ seq_len={seq_len}, batch_size={batch_size}, grad_accum={grad_accum}, "
+            f"Stage 0 ⇒ seq_len={seq_len}, batch_tokens={stage_batch_tokens}, batch_size={batch_size}, grad_accum={grad_accum}, "
             f"effective tokens={effective_tokens}, workers={workers}, prefetch={prefetch}"
         )
 
@@ -488,11 +539,12 @@ def train(args: argparse.Namespace) -> None:
                     stage_index += 1
                     if stage_index >= len(curriculum):
                         break
-                    dataloader, batch_size, grad_accum, seq_len, workers, prefetch = build_stage_loader(
+                    dataloader, batch_size, grad_accum, seq_len, workers, prefetch, stage_batch_tokens = build_stage_loader(
                         data_source,
                         tokenizer,
                         curriculum[stage_index],
                         use_gpu,
+                        device,
                         streaming=streaming_loader,
                         seed=seed,
                     )
@@ -502,8 +554,8 @@ def train(args: argparse.Namespace) -> None:
                     if use_gpu:
                         eff_tokens = batch_size * seq_len
                         print(
-                            f"\n→ Stage {stage_index} transition: seq_len={seq_len}, batch_size={batch_size}, "
-                            f"grad_accum={grad_accum}, effective tokens={eff_tokens}, workers={workers}"
+                            f"\n→ Stage {stage_index} transition: seq_len={seq_len}, batch_tokens={stage_batch_tokens}, "
+                            f"batch_size={batch_size}, grad_accum={grad_accum}, effective tokens={eff_tokens}, workers={workers}"
                         )
 
             if step >= max_steps or (use_early and steps_since_improve >= patience):
