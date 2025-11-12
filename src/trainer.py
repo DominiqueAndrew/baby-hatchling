@@ -549,10 +549,20 @@ def train(args: argparse.Namespace) -> None:
     if use_gpu:
         print(f"PyTorch CPU threads: {num_cpu_threads}")
 
-    tokenizer = SentencePieceTokenizer()
+    # Get vocab_size from model config to ensure tokenizer matches
+    model_vocab_size = cfg["model"].get("vocab_size", 32000)
+    tokenizer = SentencePieceTokenizer(vocab_size=model_vocab_size)
     pad_token_id = tokenizer.pad_id
     if tokenizer.eos_id == pad_token_id:
         raise ValueError("Tokenizer PAD and EOS IDs must differ for stable training.")
+    
+    # Verify tokenizer vocab size matches model config
+    if tokenizer.vocab_size != model_vocab_size:
+        raise ValueError(
+            f"Tokenizer vocab ({tokenizer.vocab_size}) != model config vocab ({model_vocab_size}). "
+            f"Delete data/tokenizer.model to recreate with correct vocab size."
+        )
+    
     dataset_specs = cfg.get("datasets", {}).get(args.stage, [])
     streaming_loader = train_block.get("use_streaming_loader", False)
     if streaming_loader:

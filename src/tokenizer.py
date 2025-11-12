@@ -18,6 +18,22 @@ class SentencePieceTokenizer:
         self.model_path.parent.mkdir(parents=True, exist_ok=True)
         if not self.model_path.exists():
             self._train_default(vocab_size)
+        else:
+            # Check if existing tokenizer matches requested vocab_size
+            temp_processor = spm.SentencePieceProcessor()
+            temp_processor.load(str(self.model_path))
+            existing_vocab_size = int(temp_processor.vocab_size())
+            if existing_vocab_size != vocab_size:
+                print(
+                    f"Warning: Existing tokenizer has vocab_size={existing_vocab_size}, "
+                    f"but {vocab_size} was requested. Recreating tokenizer..."
+                )
+                # Delete existing tokenizer files
+                self.model_path.unlink(missing_ok=True)
+                vocab_path = self.model_path.with_suffix(".vocab")
+                vocab_path.unlink(missing_ok=True)
+                # Create new tokenizer with correct vocab_size
+                self._train_default(vocab_size)
         self.processor = spm.SentencePieceProcessor()
         self.processor.load(str(self.model_path))
         self.bos_id = self.processor.bos_id()
