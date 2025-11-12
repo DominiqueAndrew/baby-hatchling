@@ -58,41 +58,59 @@ class SentencePieceTokenizer:
         
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as handle:
             # Create a large synthetic corpus with enough diversity to support the vocab size
-            # This includes various character combinations, numbers, and text patterns
+            # We need extensive character-level diversity to allow SentencePiece to create many tokens
             expanded_corpus = []
             
             # Base corpus
             expanded_corpus.append(DEFAULT_CORPUS)
             
-            # Add character-level diversity: all printable ASCII characters
+            # Add all printable ASCII characters in various combinations
             expanded_corpus.append(" ".join(string.printable))
+            expanded_corpus.append("".join(string.printable))
             
-            # Add number sequences
-            for i in range(1000):
+            # Add extensive number sequences with various formats
+            for i in range(5000):
                 expanded_corpus.append(f"Number {i} is {i * 2} and {i * 3}.")
+                expanded_corpus.append(f"Value {i:05d} equals {i * 1.5:.2f}.")
+                expanded_corpus.append(f"Count {i} {i+1} {i+2} {i+3} {i+4}")
             
-            # Add word combinations with various patterns
-            words = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog"]
-            for i in range(500):
+            # Add word combinations with extensive variations
+            words = ["the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "cat", "bird"]
+            for i in range(2000):
                 expanded_corpus.append(" ".join([f"{w}{i}" for w in words]))
+                expanded_corpus.append(" ".join([f"{w}_{i}" for w in words]))
+                expanded_corpus.append(" ".join([f"{w}-{i}" for w in words]))
             
-            # Add character n-grams
-            chars = string.ascii_lowercase + string.digits
-            for i in range(0, len(chars), 3):
-                expanded_corpus.append(" ".join(chars[i:i+10]))
+            # Add character n-grams with all combinations
+            chars = string.ascii_lowercase + string.ascii_uppercase + string.digits + string.punctuation
+            for i in range(0, len(chars), 2):
+                expanded_corpus.append(" ".join(chars[i:i+15]))
+                expanded_corpus.append("".join(chars[i:i+15]))
             
-            # Add repeated patterns with variations
+            # Add all possible 2-character combinations (for more token diversity)
+            for i, c1 in enumerate(string.ascii_lowercase[:26]):
+                for j, c2 in enumerate(string.ascii_lowercase[:26]):
+                    if i * 26 + j < 1000:  # Limit to avoid too many
+                        expanded_corpus.append(f"{c1}{c2} {c1}{c2}{i} {c2}{c1}{j}")
+            
+            # Add repeated patterns with extensive variations
             base_text = DEFAULT_CORPUS
-            for i in range(200):
-                expanded_corpus.append(f"{base_text} Variation {i}. " + " ".join([chr(ord('a') + (j % 26)) for j in range(20)]))
+            for i in range(1000):
+                expanded_corpus.append(f"{base_text} Variation {i}. " + " ".join([chr(ord('a') + (j % 26)) for j in range(30)]))
+                expanded_corpus.append(f"{base_text} Version {i:04d}. " + "".join([chr(ord('A') + (j % 26)) for j in range(30)]))
+            
+            # Add Unicode character sequences for additional diversity
+            for i in range(500):
+                expanded_corpus.append(" ".join([chr(0x0020 + (i * 7 + j) % 0x007F) for j in range(20) if 0x0020 <= (0x0020 + (i * 7 + j) % 0x007F) <= 0x007E]))
             
             # Write the expanded corpus
             handle.write("\n".join(expanded_corpus))
             corpus_path = handle.name
         
         try:
-            # Use hard_vocab_limit=True to force creation of exactly vocab_size tokens
-            # This ensures we get the full vocabulary even if the corpus is small
+            # Use byte_fallback to allow creation of full vocab_size
+            # This enables byte-level encoding for tokens that can't be represented
+            # Otherwise, we're limited by the corpus diversity
             spm.SentencePieceTrainer.train(
                 input=corpus_path,
                 model_prefix=str(self.model_path.with_suffix("")),
@@ -104,6 +122,7 @@ class SentencePieceTokenizer:
                 pad_id=0,
                 unk_id=3,
                 hard_vocab_limit=True,  # Force exact vocab size
+                byte_fallback=True,  # Allow byte-level fallback to reach vocab_size
                 split_by_unicode_script=True,
                 split_by_number=True,
                 split_by_whitespace=True,
