@@ -176,9 +176,20 @@ Coverage:
 Use the tiny `hn_toddler` config to sanity-check new data or training changes with episodic memory still enabled:
 
 ```bash
+# Stage A – pretrain
 bash scripts/run_toddler.sh configs/hn_toddler.yaml
+
+# Stage B – SFT (loads Stage A checkpoint unless you override path)
+bash scripts/run_toddler_sft.sh configs/hn_toddler_sft.yaml
+
+# Stage C – micro-RLVR (loads Stage B checkpoint)
+bash scripts/run_toddler_rlvr.sh configs/hn_toddler_rlvr.yaml
 ```
 
-It trains an 8-layer, 256d model on a single Wikitext-2 shard (streaming loader, `seq_len=192`, 600 steps, no grad accumulation), so it typically finishes within ~20 minutes on a 24 GB GPU while keeping the SQLite episodic store active (4 MiB cap). Tune `datasets.pretrain[0].limit` or swap in your own shard for other quick viability checks.
+- Stage A trains an 8-layer, 256d model on a single Wikitext-2 shard (streaming loader, `seq_len=192`, 600 steps, no grad accumulation) and keeps the SQLite episodic store active (4 MiB cap).
+- Stage B runs ~600 supervised steps on 2 k instruction traces (Alpaca/OpenHermes).
+- Stage C runs ~200 micro-RLVR updates on GSM8K-mini + Humaneval-mini to exercise the reward plumbing.
+
+All three stages finish within roughly an hour on a 24 GB GPU, giving you an end-to-end but tiny checkpoint (`out/hn_toddler_rlvr.pt`) you can chat with or evaluate before scaling configs back up. Tune the dataset `limit` fields if you want even faster iterations.
 
 Everything needed to run the sequential training stages on your cloud GPU (crawler → pretrain → SFT → RLVR → eval) now ships in-tree with spiking gates, dynamic RL controls, curriculum-aware training, and scripts wired to the new Hatchling-NEURO configs.

@@ -1,0 +1,66 @@
+seed: 7
+threads: 8
+model:
+  name: hn_toddler
+  d_model: 256
+  n_layers: 8
+  n_heads: 4
+  dk: 32
+  dv: 32
+  d_ff: 1024
+  rank_gate: 128
+  group_kv: 4
+  gw_tokens: 0
+  max_seq: 512
+  spike_decay: 0.9
+  spike_threshold: 0.4
+  spike_surrogate_beta: 8.0
+  episodic_bytes: 4194304
+  use_predictive_head: false
+  use_episodic_memory: true
+  use_curiosity_bonus: false
+  use_gradient_checkpointing: false
+  kda_chunk_size: 32
+  kda_mode: scan
+  kda_scan_min_len: 64
+  token_drop:
+    enabled: false
+train:
+  use_streaming_loader: false
+  sft:
+    seq_len: 256
+    batch_tokens: 2048
+    grad_accum: 1
+    grad_clip: 1.0
+    max_steps: 600
+    lr_schedule:
+      type: cosine
+      warmup_steps: 50
+      min_factor: 0.2
+    early_stopping:
+      enabled: false
+optim:
+  type: adapm
+  lr: 0.0003
+  beta: 0.9
+  gamma: 0.25
+  eps: 1.0e-08
+  weight_decay: 0.0
+loss:
+  lambda_pc: 0.0
+  lambda_epi: 0.01
+  lambda_kl: 0.0
+datasets:
+  sft:
+    - name: alpaca_tiny
+      hf_id: tatsu-lab/alpaca
+      split: train
+      limit: 1000
+      template: |
+        Instruction: {instruction}
+        Input: {input}
+        Response: {output}
+    - name: openhermes_tiny
+      hf_id: teknium/OpenHermes-2.5
+      split: train
+      limit: 1000
