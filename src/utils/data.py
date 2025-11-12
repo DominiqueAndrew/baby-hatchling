@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Mapping, Sequence
+from typing import Iterable, Iterator, List, Mapping, Sequence
 
 from datasketch import MinHash, MinHashLSH
 from datasets import DatasetDict, load_dataset
@@ -129,6 +129,49 @@ def load_text_splits(specs: Sequence[dict], text_field: str = "text") -> List[Sa
     
     print(f"Total samples loaded: {len(all_samples)}")
     return all_samples
+
+
+def stream_dataset_texts(spec: Mapping[str, object], text_field: str = "text") -> Iterator[str]:
+    """Yields texts from a dataset spec without materializing everything in memory."""
+
+    local_path = spec.get("path")
+    if local_path:
+        for sample in _load_local_samples(local_path, spec.get("name")):
+            yield sample.text
+        return
+
+    config_name = spec.get("config")
+    trust_remote_code = spec.get("trust_remote_code", False)
+    split = spec.get("split", "train")
+    dataset = (
+        load_dataset(
+            spec["hf_id"],
+            config_name,
+            split=split,
+            trust_remote_code=trust_remote_code,
+            streaming=True,
+        )
+        if config_name
+        else load_dataset(
+            spec["hf_id"],
+            split=split,
+            trust_remote_code=trust_remote_code,
+            streaming=True,
+        )
+    )
+    limit = spec.get("limit")
+    count = 0
+    for example in dataset:
+        template = spec.get("template")
+        if template:
+            text = _render_template(template, example)
+        else:
+            text = example.get(spec.get("field", text_field)) or example.get("content") or ""
+        if text:
+            yield text
+            count += 1
+            if limit is not None and count >= limit:
+                break
 
 
 def minhash_signatures(samples: Iterable[Sample], num_perm: int = 64) -> List[MinHash]:

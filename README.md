@@ -172,4 +172,13 @@ Coverage:
 - **Ablations:** Flip `model.use_predictive_head`, `model.use_episodic_memory`, or `model.use_curiosity_bonus` in YAML before re-running scripts. `scripts/run_ablation_eval.sh` logs each sweep.
 - **Long context:** Increase `model.max_seq` and `train.*.seq_len` together; linear-state KDA keeps memory flat, but watch VRAM when raising `batch_tokens`.
 
+## 9. Toddler sanity check (20 min)
+Use the tiny `hn_toddler` config to sanity-check new data or training changes with episodic memory still enabled:
+
+```bash
+bash scripts/run_toddler.sh configs/hn_toddler.yaml
+```
+
+It trains an 8-layer, 256d model on a single Wikitext-2 shard (~1.5 K steps, `seq_len=256`), so it finishes in ~20 minutes on a 24 GB GPU while keeping the SQLite episodic store active (4 MiB cap). Tune `datasets.pretrain[0].limit` to match your quick-test corpus if needed.
+
 Everything needed to run the sequential training stages on your cloud GPU (crawler → pretrain → SFT → RLVR → eval) now ships in-tree with spiking gates, dynamic RL controls, curriculum-aware training, and scripts wired to the new Hatchling-NEURO configs.

@@ -110,7 +110,15 @@ class BabyHatchlingModel(nn.Module):
         for layer in self.layers:
             if isinstance(layer, KDABlock):
                 layer_state = next(state_iter, None)
-                hidden, updated_state = layer(hidden, layer_state)
+                if self.use_checkpoint and self.training and layer_state is None:
+                    def _run_layer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                        y, new_state = layer(x, None)
+                        return y, new_state.tensor, new_state.spike_mem
+
+                    hidden, state_tensor, spike_tensor = checkpoint(_run_layer, hidden, use_reentrant=False)
+                    updated_state = KDAState(tensor=state_tensor, spike_mem=spike_tensor)
+                else:
+                    hidden, updated_state = layer(hidden, layer_state)
                 new_states.append(updated_state)
             else:
                 if self.use_checkpoint and self.training:

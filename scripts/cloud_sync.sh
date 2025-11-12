@@ -93,3 +93,4 @@ ls -lht "$LOCAL_LOGS"/*.csv 2>/dev/null | head -5 || echo "  (no log files yet)"
 log_info "Latest checkpoints:"
 ls -lht "$LOCAL_OUT"/*.pt 2>/dev/null | head -5 || echo "  (no checkpoints yet)"
 
+

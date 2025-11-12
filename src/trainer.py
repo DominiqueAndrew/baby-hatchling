@@ -13,14 +13,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset, get_worker_info
 from tqdm import tqdm
 
 from .model import BabyHatchlingModel, build_model
 from .optim import AdaPM
 from .tokenizer import SentencePieceTokenizer
 from .utils.config import load_config
-from .utils.data import contamination_report, load_text_splits
+from .utils.data import contamination_report, load_text_splits, stream_dataset_texts
 from .utils.logging import CSVLogger
 from .utils.sparsity import MSTSparsifier, SparsitySchedule, collect_sparse_modules
 
@@ -54,6 +54,43 @@ class ChunkedDataset(Dataset):
         tokens = seq[:-1].clone()
         targets = seq[1:].clone()
         return Batch(tokens=tokens, targets=targets)
+
+
+class StreamingChunkedDataset(IterableDataset):
+    """Iterable dataset that tokenizes streaming samples on the fly."""
+
+    def __init__(
+        self,
+        specs: Sequence[dict],
+        tokenizer: SentencePieceTokenizer,
+        seq_len: int,
+        *,
+        seed: int,
+    ) -> None:
+        if not specs:
+            raise ValueError("StreamingChunkedDataset requires at least one dataset spec.")
+        self.specs = list(specs)
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.seed = seed
+
+    def __iter__(self):
+        worker = get_worker_info()
+        worker_seed = self.seed + (worker.id if worker else 0)
+        rng = random.Random(worker_seed)
+        token_buffer: list[int] = []
+        while True:
+            for spec in rng.sample(self.specs, len(self.specs)):
+                for text in stream_dataset_texts(spec):
+                    ids = self.tokenizer.encode(text)
+                    if not ids:
+                        continue
+                    token_buffer.extend(ids)
+                    while len(token_buffer) > self.seq_len:
+                        window = token_buffer[: self.seq_len + 1]
+                        token_buffer = token_buffer[self.seq_len :]
+                        seq = torch.tensor(window, dtype=torch.long)
+                        yield Batch(tokens=seq[:-1], targets=seq[1:])
 
 
 def collate_fn(batch: Sequence[Batch]) -> Batch:
@@ -154,27 +191,43 @@ def auto_workers(use_gpu: bool, seq_len: int = 1024) -> tuple[int, int | None]:
 
 
 def build_stage_loader(
-    texts: Sequence[str],
+    data_source,
     tokenizer: SentencePieceTokenizer,
     stage_cfg: dict,
     use_gpu: bool,
+    *,
+    streaming: bool,
+    seed: int,
 ) -> tuple[DataLoader, int, int, int, int, int | None]:
     seq_len = stage_cfg["seq_len"]
-    dataset = ChunkedDataset(texts, tokenizer, seq_len)
     batch_tokens = stage_cfg["batch_tokens"]
     batch_size = max(1, batch_tokens // seq_len)
-    num_workers, prefetch = auto_workers(use_gpu, seq_len)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=num_workers,
-        pin_memory=use_gpu,
-        prefetch_factor=prefetch,
-        persistent_workers=num_workers > 0,
-        timeout=60,
-    )
+    if streaming:
+        dataset = StreamingChunkedDataset(data_source, tokenizer, seq_len, seed=seed)
+        num_workers = 0
+        prefetch = None
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            collate_fn=collate_fn,
+            num_workers=0,
+            pin_memory=use_gpu,
+            persistent_workers=False,
+        )
+    else:
+        dataset = ChunkedDataset(data_source, tokenizer, seq_len)
+        num_workers, prefetch = auto_workers(use_gpu, seq_len)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            pin_memory=use_gpu,
+            prefetch_factor=prefetch,
+            persistent_workers=num_workers > 0,
+            timeout=60,
+        )
     grad_accum = stage_cfg.get("grad_accum", 1)
     return dataloader, batch_size, grad_accum, seq_len, num_workers, prefetch
 
@@ -245,7 +298,14 @@ def train(args: argparse.Namespace) -> None:
         print(f"PyTorch CPU threads: {num_cpu_threads}")
 
     tokenizer = SentencePieceTokenizer()
-    texts = load_texts(cfg.get("datasets", {}).get(args.stage, []))
+    dataset_specs = cfg.get("datasets", {}).get(args.stage, [])
+    streaming_loader = train_block.get("use_streaming_loader", False)
+    if streaming_loader:
+        data_source = dataset_specs
+        texts = None
+    else:
+        texts = load_texts(dataset_specs)
+        data_source = texts
 
     model = build_model(cfg["model"])
     device = torch.device("cuda" if use_gpu else "cpu")
@@ -296,8 +356,14 @@ def train(args: argparse.Namespace) -> None:
     steps_since_improve = 0
 
     stage_index = 0
+    seed = cfg.get("seed", 0)
     dataloader, batch_size, grad_accum, seq_len, workers, prefetch = build_stage_loader(
-        texts, tokenizer, curriculum[stage_index], use_gpu
+        data_source,
+        tokenizer,
+        curriculum[stage_index],
+        use_gpu,
+        streaming=streaming_loader,
+        seed=seed,
     )
     dataloader_iter = iter(dataloader)
     stage_step = 0
@@ -420,7 +486,12 @@ def train(args: argparse.Namespace) -> None:
                     if stage_index >= len(curriculum):
                         break
                     dataloader, batch_size, grad_accum, seq_len, workers, prefetch = build_stage_loader(
-                        texts, tokenizer, curriculum[stage_index], use_gpu
+                        data_source,
+                        tokenizer,
+                        curriculum[stage_index],
+                        use_gpu,
+                        streaming=streaming_loader,
+                        seed=seed,
                     )
                     dataloader_iter = iter(dataloader)
                     stage_step = 0

@@ -33,3 +33,4 @@ PID=$!
 echo "✅ Training started in background (PID: $PID)"
 echo "📊 Monitor with: tail -f logs/pretrain_runpod.txt"
 echo "🛑 Stop with: kill $PID"
+

@@ -181,3 +181,4 @@ echo "4. Check GPU usage:"
 echo "   bash scripts/cloud_monitor.sh gpu"
 echo ""
 log_info "Setup complete! Happy training! 🚀"
+

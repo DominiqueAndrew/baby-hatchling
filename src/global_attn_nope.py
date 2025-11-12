@@ -1,10 +1,10 @@
 """Global NoPE attention layer used every 4th block."""
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from .modules import HeadwiseRMSNorm, RMSNorm, SwiGLU
@@ -43,10 +43,6 @@ class GlobalNoPEBlock(nn.Module):
         else:
             self.register_parameter("gw_tokens", None)
         
-        # Cache for causal mask to avoid recreating every forward pass
-        self.register_buffer("_causal_mask_cache", None, persistent=False)
-        self._cached_mask_size = 0
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq, dim = x.shape
         h = self.norm_in(x)
@@ -82,16 +78,13 @@ class GlobalNoPEBlock(nn.Module):
         k_flat = k.permute(0, 2, 1, 3).reshape(bsz * heads, t, self.dk)
         v_flat = v.permute(0, 2, 1, 3).reshape(bsz * heads, t, self.dv)
 
-        scores = torch.bmm(q_flat, k_flat.transpose(1, 2)) / math.sqrt(self.dk)
-        
-        # Use cached causal mask to avoid recreating every forward pass
-        if self._causal_mask_cache is None or self._cached_mask_size < t:
-            self._causal_mask_cache = torch.tril(torch.ones(t, t, device=q.device, dtype=torch.bool))
-            self._cached_mask_size = t
-        causal_mask = self._causal_mask_cache[:t, :t]
-        
-        scores = scores.masked_fill(~causal_mask, float("-inf"))
-        weights = torch.softmax(scores, dim=-1)
-        ctx = torch.bmm(weights, v_flat)
+        ctx = F.scaled_dot_product_attention(
+            q_flat,
+            k_flat,
+            v_flat,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=True,
+        )
         ctx = ctx.view(bsz, heads, t, self.dv).permute(0, 2, 1, 3)
         return ctx

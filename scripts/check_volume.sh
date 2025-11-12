@@ -29,3 +29,4 @@ echo ""
 echo "📦 Largest directories in current location:"
 du -h --max-depth=1 . 2>/dev/null | sort -hr | head -10
 
+
