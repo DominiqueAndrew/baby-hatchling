@@ -134,6 +134,8 @@ class StreamingChunkedDataset(IterableDataset):
         self.tokenizer = tokenizer
         self.seq_len = seq_len
         self.seed = seed
+        # Estimate shard count so we can clamp worker fan-out on tiny corpora.
+        self.num_shards = max(1, len(self.specs))
 
     def __iter__(self):
         worker = get_worker_info()
@@ -433,6 +435,31 @@ def maybe_scale_batch_tokens(
     return aligned
 
 
+def _cap_workers(num_workers: int, dataset, stage_cfg: dict, *, label: str) -> tuple[int, bool]:
+    """Clamp worker count to either config max or dataset-provided shard count."""
+    effective = max(0, num_workers)
+    configured_cap = stage_cfg.get("max_workers")
+    dataset_cap = getattr(dataset, "num_shards", None)
+    target_cap = None
+    reason = None
+    if isinstance(configured_cap, int) and configured_cap >= 0:
+        target_cap = configured_cap
+        reason = "config max_workers"
+    if isinstance(dataset_cap, int) and dataset_cap > 0:
+        if target_cap is None or dataset_cap < target_cap:
+            target_cap = dataset_cap
+            reason = f"{label}.num_shards"
+    if target_cap is not None and effective > target_cap:
+        print(f"[data] Reducing dataloader workers {effective} -> {target_cap} ({reason})")
+        effective = target_cap
+    persistent = stage_cfg.get("persistent_workers")
+    if persistent is None:
+        persistent = effective > 0
+    else:
+        persistent = bool(persistent) and effective > 0
+    return effective, persistent
+
+
 def build_stage_loader(
     data_source,
     tokenizer: SentencePieceTokenizer,
@@ -447,37 +474,58 @@ def build_stage_loader(
     batch_tokens = stage_cfg["batch_tokens"]
     batch_tokens = maybe_scale_batch_tokens(batch_tokens, seq_len, device if use_gpu else None, stage_cfg.get("dynamic_batch"))
     batch_size = max(1, batch_tokens // seq_len)
+    loader_timeout = stage_cfg.get("timeout", 120)
+    pin_memory = stage_cfg.get("pin_memory", use_gpu)
+    prefetch_used: int | None = None
     if streaming:
         dataset = StreamingChunkedDataset(data_source, tokenizer, seq_len, seed=seed)
-        num_workers = stage_cfg.get("num_workers", 8 if use_gpu else 0)
-        prefetch = stage_cfg.get("prefetch_factor", 4 if num_workers > 0 else None)
+        configured_workers = stage_cfg.get("num_workers")
+        if configured_workers is None:
+            configured_workers = 1 if use_gpu else 0
+        num_workers, persistent_workers = _cap_workers(int(configured_workers), dataset, stage_cfg, label="dataset")
+        prefetch = stage_cfg.get("prefetch_factor")
+        if prefetch is None and num_workers > 0:
+            prefetch = 2
         loader_kwargs = dict(
             dataset=dataset,
             batch_size=batch_size,
             collate_fn=collate_fn,
             num_workers=num_workers,
-            pin_memory=use_gpu,
-            persistent_workers=num_workers > 0,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
         )
+        if loader_timeout is not None:
+            loader_kwargs["timeout"] = loader_timeout
         if num_workers > 0 and prefetch:
             loader_kwargs["prefetch_factor"] = prefetch
+            prefetch_used = prefetch
         dataloader = DataLoader(**loader_kwargs)
     else:
         dataset = ChunkedDataset(data_source, tokenizer, seq_len)
-        num_workers, prefetch = auto_workers(use_gpu, seq_len, device if use_gpu else None)
-        dataloader = DataLoader(
-            dataset,
+        if "num_workers" in stage_cfg:
+            configured_workers = stage_cfg.get("num_workers")
+            num_workers = max(0, int(configured_workers or 0))
+            prefetch = stage_cfg.get("prefetch_factor")
+        else:
+            num_workers, prefetch = auto_workers(use_gpu, seq_len, device if use_gpu else None)
+        num_workers, persistent_workers = _cap_workers(num_workers, dataset, stage_cfg, label="dataset")
+        loader_kwargs = dict(
+            dataset=dataset,
             batch_size=batch_size,
             shuffle=True,
             collate_fn=collate_fn,
             num_workers=num_workers,
-            pin_memory=use_gpu,
-            prefetch_factor=prefetch,
-            persistent_workers=num_workers > 0,
-            timeout=60,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
         )
+        if loader_timeout is not None:
+            loader_kwargs["timeout"] = loader_timeout
+        if num_workers > 0 and prefetch:
+            loader_kwargs["prefetch_factor"] = prefetch
+            prefetch_used = prefetch
+        dataloader = DataLoader(**loader_kwargs)
     grad_accum = stage_cfg.get("grad_accum", 1)
-    return dataloader, batch_size, grad_accum, seq_len, num_workers, prefetch, batch_tokens
+    return dataloader, batch_size, grad_accum, seq_len, num_workers, prefetch_used, batch_tokens
 
 
 def build_scheduler(optimizer: torch.optim.Optimizer, lr_cfg: dict, total_steps: int):
@@ -761,9 +809,14 @@ def train(args: argparse.Namespace) -> None:
             micro_step += 1
 
             if micro_step % grad_accum == 0:
+                should_log_grads = step % 10 == 0
+                grad_pct = grad_norm = None
+                block_norms: dict[str, float] | None = None
                 if use_amp:
                     scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                if should_log_grads:
+                    grad_pct, grad_norm, block_norms = grad_flow_summary(model)
                 if use_amp:
                     scaler.step(optimizer)
                     scaler.update()
@@ -781,8 +834,7 @@ def train(args: argparse.Namespace) -> None:
                     print(f"[lr] step={step} lr={current_lr:.3e}")
                 if use_amp and step % 20 == 0:
                     print(f"[amp] step={step} scale={scaler.get_scale():.2e}")
-                if step % 10 == 0:
-                    grad_pct, grad_norm, block_norms = grad_flow_summary(model)
+                if should_log_grads and grad_pct is not None and grad_norm is not None:
                     logger.log(
                         {
                             "step": step,
