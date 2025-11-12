@@ -556,12 +556,15 @@ def train(args: argparse.Namespace) -> None:
     if tokenizer.eos_id == pad_token_id:
         raise ValueError("Tokenizer PAD and EOS IDs must differ for stable training.")
     
-    # Verify tokenizer vocab size matches model config
-    if tokenizer.vocab_size != model_vocab_size:
-        raise ValueError(
-            f"Tokenizer vocab ({tokenizer.vocab_size}) != model config vocab ({model_vocab_size}). "
-            f"Delete data/tokenizer.model to recreate with correct vocab size."
+    # Use the actual tokenizer vocab size (may be less than requested for synthetic corpora)
+    actual_vocab_size = tokenizer.vocab_size
+    if actual_vocab_size != model_vocab_size:
+        print(
+            f"Note: Using tokenizer vocab_size={actual_vocab_size} instead of "
+            f"config vocab_size={model_vocab_size}. Updating model config."
         )
+        # Update model config to match tokenizer
+        cfg["model"]["vocab_size"] = actual_vocab_size
     
     dataset_specs = cfg.get("datasets", {}).get(args.stage, [])
     streaming_loader = train_block.get("use_streaming_loader", False)
